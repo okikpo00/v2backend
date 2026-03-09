@@ -1,0 +1,22 @@
+# Node
+node_modules
+npm-debug.log*
+yarn-error.log*
+
+# Build outputs
+dist
+build
+.out
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vite / cache
+.vite
+.cache
