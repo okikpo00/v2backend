@@ -134,20 +134,29 @@ assertStrongPassword(password);
        DUPLICATE CHECK
     ========================= */
 
-    const [dup] = await conn.query(
-      `SELECT id, email, username_lower
-       FROM users
-       WHERE email = ? OR username_lower = ?
-       LIMIT 1`,
-      [emailNorm, usernameLower]
-    );
+ const [dup] = await conn.query(
+  `SELECT email, username_lower
+   FROM users
+   WHERE email = ? OR username_lower = ?
+   LIMIT 1`,
+  [emailNorm, usernameLower]
+);
 
-    if (dup.length) {
-      const err = new Error('DUPLICATE');
-      err.code = 'DUPLICATE';
-      console.error('[REGISTER][DUPLICATE]', dup[0]);
-      throw err;
-    }
+if (dup.length) {
+
+  if (dup[0].email === emailNorm) {
+    const err = new Error('Email already registered');
+    err.code = 'EMAIL_TAKEN';
+    throw err;
+  }
+
+  if (dup[0].username_lower === usernameLower) {
+    const err = new Error('Username already taken');
+    err.code = 'USERNAME_TAKEN';
+    throw err;
+  }
+
+}
 
     /* =========================
        REFERRAL HANDLING
@@ -517,22 +526,63 @@ const {
 /* =========================
    LOGIN
 ========================= */
+
+
 exports.login = async ({ identifier, password, ip, user_agent }) => {
+
+  if (!identifier || !password) {
+    const e = new Error("INVALID_CREDENTIALS");
+    e.code = "INVALID_CREDENTIALS";
+    throw e;
+  }
+
   const idEmail = normalizeEmail(identifier);
-  const idUser = normalizeUsername(identifier);
+  const idUser  = normalizeUsername(identifier);
 
   const [[user]] = await pool.query(
-    `SELECT * FROM users
+    `SELECT *
+     FROM users
      WHERE email = ? OR username_lower = ?
      LIMIT 1`,
     [idEmail, idUser]
   );
 
-  if (!user) throw new Error('INVALID_CREDENTIALS');
-  if (!user.email_verified_at) throw new Error('EMAIL_NOT_VERIFIED');
+  /* =========================
+     PASSWORD VERIFICATION
+     (Timing-safe)
+  ========================= */
 
-  const valid = await verifyPassword(password, user.password_hash);
-  if (!valid) throw new Error('INVALID_CREDENTIALS');
+  const passwordHash = user?.password_hash;
+
+  if (!passwordHash) {
+    // run fake password verification to prevent timing attacks
+    await verifyPassword(password, "$2b$10$invalidinvalidinvalidinvalidinv");
+    const e = new Error("INVALID_CREDENTIALS");
+    e.code = "INVALID_CREDENTIALS";
+    throw e;
+  }
+
+  const valid = await verifyPassword(password, passwordHash);
+
+  if (!valid) {
+    const e = new Error("INVALID_CREDENTIALS");
+    e.code = "INVALID_CREDENTIALS";
+    throw e;
+  }
+
+  /* =========================
+     EMAIL VERIFICATION
+  ========================= */
+
+  if (!user.email_verified_at) {
+    const e = new Error("EMAIL_NOT_VERIFIED");
+    e.code = "EMAIL_NOT_VERIFIED";
+    throw e;
+  }
+
+  /* =========================
+     SESSION CREATION
+  ========================= */
 
   const sessionId = uuidv4();
 
@@ -542,16 +592,27 @@ exports.login = async ({ identifier, password, ip, user_agent }) => {
     sv: user.security_version
   });
 
+  const refreshHash = hashToken(refreshToken);
+
   await pool.query(
     `INSERT INTO user_sessions
      (session_id, user_id, refresh_token_hash, ip_address, user_agent, expires_at)
      VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))`,
-    [sessionId, user.id, hashToken(refreshToken), ip, user_agent]
+    [
+      sessionId,
+      user.id,
+      refreshHash,
+      ip || null,
+      user_agent || null
+    ]
   );
 
-  return { user, sessionId, refreshToken };
+  return {
+    user,
+    sessionId,
+    refreshToken
+  };
 };
-
 /* =========================
    REFRESH (COOKIE BASED)
 ========================= */
@@ -634,36 +695,124 @@ exports.logoutAll = async ({ user_id, ip, user_agent }) => {
 
 /* -------------------- FORGOT / RESET -------------------- */
 exports.forgotPassword = async ({ email, ip, user_agent }) => {
+
+  console.log('[FORGOT_PASSWORD] incoming email:', email);
+
+  /* =========================
+     EMAIL VALIDATION
+  ========================= */
+
+  if (!email || !isValidEmail(email)) {
+    console.log('[FORGOT_PASSWORD] invalid email format:', email);
+
+    const err = new Error('Invalid email address');
+    err.code = 'INVALID_EMAIL';
+    throw err;
+  }
+
   const emailNorm = normalizeEmail(email);
-  const [[user]] = await pool.query(
-    `SELECT id FROM users WHERE email = ? LIMIT 1`,
-    [emailNorm]
-  );
-  if (!user) return null;
+  console.log('[FORGOT_PASSWORD] normalized email:', emailNorm);
+
+  /* =========================
+     FIND USER
+  ========================= */
+
+  let user;
+
+  try {
+
+    const result = await pool.query(
+      `SELECT id
+       FROM users
+       WHERE email = ?
+       LIMIT 1`,
+      [emailNorm]
+    );
+
+    console.log('[FORGOT_PASSWORD] DB result:', result);
+
+    user = result[0][0];
+
+  } catch (dbErr) {
+
+    console.error('[FORGOT_PASSWORD] DB ERROR:', dbErr);
+    throw dbErr;
+
+  }
+
+  /* =========================
+     SECURITY RULE
+  ========================= */
+
+  if (!user) {
+    console.log('[FORGOT_PASSWORD] user not found (silent return)');
+    return null;
+  }
+
+  console.log('[FORGOT_PASSWORD] user found:', user.id);
+
+  /* =========================
+     CREATE RESET TOKEN
+  ========================= */
 
   const raw = generateToken();
-  await pool.query(
-    `INSERT INTO password_reset_tokens
-     (user_id, token_hash, expires_at)
-     VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE))`,
-    [user.id, hashToken(raw)]
-  );
+  console.log('[FORGOT_PASSWORD] generated token');
 
-  await audit({
-    user_id: user.id,
-    action: 'FORGOT_PASSWORD',
-    ip_address: ip,
-    user_agent
-  });
-// 📧 Send password reset email
-setImmediate(async () => {
   try {
-    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${raw}`;
 
-    await sendEmail(
-      emailNorm,
-      'Reset your Trebetta password',
-      `
+    await pool.query(
+      `INSERT INTO password_reset_tokens
+       (user_id, token_hash, expires_at)
+       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE))`,
+      [user.id, hashToken(raw)]
+    );
+
+    console.log('[FORGOT_PASSWORD] token inserted');
+
+  } catch (insertErr) {
+
+    console.error('[FORGOT_PASSWORD] TOKEN INSERT ERROR:', insertErr);
+    throw insertErr;
+
+  }
+
+  /* =========================
+     AUDIT LOG
+  ========================= */
+
+  try {
+
+    await audit({
+      user_id: user.id,
+      action: 'FORGOT_PASSWORD',
+      ip_address: ip,
+      user_agent
+    });
+
+    console.log('[FORGOT_PASSWORD] audit written');
+
+  } catch (auditErr) {
+
+    console.error('[FORGOT_PASSWORD] AUDIT ERROR:', auditErr);
+
+  }
+
+  /* =========================
+     SEND EMAIL
+  ========================= */
+
+  setImmediate(async () => {
+    try {
+
+      console.log('[FORGOT_PASSWORD] sending email');
+
+      const resetUrl =
+        `${process.env.FRONTEND_URL}/reset-password?token=${raw}`;
+
+      await sendEmail(
+        emailNorm,
+        'Reset your Trebetta password',
+        `
         <div style="font-family: Arial, sans-serif">
           <p>You requested to reset your password.</p>
           <p>
@@ -671,16 +820,20 @@ setImmediate(async () => {
           </p>
           <p>This link expires in 15 minutes.</p>
         </div>
-      `
-    );
-  } catch (e) {
-    console.warn('[FORGOT_PASSWORD] email failed:', e?.message);
-  }
-});
+        `
+      );
+
+      console.log('[FORGOT_PASSWORD] email sent');
+
+    } catch (e) {
+
+      console.warn('[FORGOT_PASSWORD] EMAIL FAILED:', e?.message);
+
+    }
+  });
 
   return raw;
 };
-
 exports.resetPassword = async ({ token, password, ip, user_agent }) => {
   assertStrongPassword(password);
   const tokenHash = hashToken(token);

@@ -39,19 +39,21 @@ exports.register = async (req, res) => {
   } catch (err) {
     console.error('[REGISTER_CONTROLLER_ERROR]', err);
 
-    const map = {
-      MISSING_REQUIRED_FIELDS: 400,
-      INVALID_EMAIL: 400,
-      PASSWORD_REQUIRED: 400,
-      WEAK_PASSWORD: 400,
-      DUPLICATE: 409,
-      INVALID_REFERRAL: 400
-    };
+   const map = {
+  MISSING_REQUIRED_FIELDS: 400,
+  INVALID_EMAIL: 400,
+  PASSWORD_REQUIRED: 400,
+  WEAK_PASSWORD: 400,
+  EMAIL_TAKEN: 409,
+  USERNAME_TAKEN: 409,
+  INVALID_REFERRAL: 400
+};
 
-    return res.status(map[err.code] || 500).json({
-      success: false,
-      message: err.message || 'Registration failed'
-    });
+   return res.status(map[err.code] || 500).json({
+  success: false,
+  code: err.code || 'SERVER_ERROR',
+  message: err.message || 'Registration failed'
+});
   }
 };
 
@@ -119,31 +121,108 @@ exports.verifyEmail = async (req, res) => {
    LOGIN
 ========================= */
 exports.login = async (req, res) => {
-  const { user, sessionId, refreshToken } = await Auth.login({
-    identifier: req.body.identifier,
-    password: req.body.password,
-    ip: req.ip,
-    user_agent: req.headers['user-agent']
-  });
+  try {
 
-  const accessToken = signAccessToken({
-    sub: user.uuid,
-    sid: sessionId,
-    sv: user.security_version
-  });
+    const identifier = req.body?.identifier;
+    const password = req.body?.password;
 
-  res.cookie(
-    REFRESH_COOKIE_NAME,
-    refreshToken,
-    getRefreshCookieOptions()
-  );
+    /* =========================
+       BASIC VALIDATION
+    ========================= */
 
-  res.json({
-    success: true,
-    data: { accessToken, sessionId }
-  });
+    if (!identifier || !password) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_REQUEST",
+        message: "Identifier and password are required"
+      });
+    }
+
+    /* =========================
+       AUTH SERVICE
+    ========================= */
+
+    const { user, sessionId, refreshToken } = await Auth.login({
+      identifier,
+      password,
+      ip: req.ip,
+      user_agent: req.headers["user-agent"]
+    });
+
+    /* =========================
+       ACCESS TOKEN
+    ========================= */
+
+    const accessToken = signAccessToken({
+      sub: user.uuid,
+      sid: sessionId,
+      sv: user.security_version
+    });
+
+    /* =========================
+       REFRESH COOKIE
+    ========================= */
+
+    res.cookie(
+      REFRESH_COOKIE_NAME,
+      refreshToken,
+      getRefreshCookieOptions()
+    );
+
+    /* =========================
+       SUCCESS RESPONSE
+    ========================= */
+
+    return res.json({
+      success: true,
+      data: {
+        accessToken,
+        sessionId
+      }
+    });
+
+  } catch (err) {
+
+    const code = err.code || err.message;
+
+    /* =========================
+       INVALID CREDENTIALS
+    ========================= */
+
+    if (code === "INVALID_CREDENTIALS") {
+      return res.status(401).json({
+        success: false,
+        code: "INVALID_CREDENTIALS",
+        message: "Incorrect email or password"
+      });
+    }
+
+    /* =========================
+       EMAIL NOT VERIFIED
+    ========================= */
+
+    if (code === "EMAIL_NOT_VERIFIED") {
+      return res.status(403).json({
+        success: false,
+        code: "EMAIL_NOT_VERIFIED",
+        message: "Email not verified"
+      });
+    }
+
+    /* =========================
+       UNEXPECTED ERROR
+    ========================= */
+
+    console.error("[LOGIN_CONTROLLER_ERROR]", err);
+
+    return res.status(500).json({
+      success: false,
+      code: "SERVER_ERROR",
+      message: "Internal server error"
+    });
+
+  }
 };
-
 /* =========================
    REFRESH
 ========================= */
@@ -239,12 +318,37 @@ exports.logoutAll = async (req, res) => {
    PASSWORD RESET
 ========================= */
 exports.forgotPassword = async (req, res) => {
-  await Auth.forgotPassword({
-    email: req.body.email,
-    ip: req.ip,
-    user_agent: req.headers['user-agent']
-  });
-  res.json({ success: true });
+  try {
+
+    await Auth.forgotPassword({
+      email: req.body.email,
+      ip: req.ip,
+      user_agent: req.headers['user-agent']
+    });
+
+    return res.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    if (err.code === "INVALID_EMAIL") {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_EMAIL",
+        message: "Invalid email address"
+      });
+    }
+
+    console.error("[FORGOT_PASSWORD_CONTROLLER_ERROR]", err);
+
+    return res.status(500).json({
+      success: false,
+      code: "SERVER_ERROR",
+      message: "Internal server error"
+    });
+
+  }
 };
 
 exports.resetPassword = async (req, res) => {

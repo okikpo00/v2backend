@@ -8,9 +8,22 @@ exports.lockFunds = async ({
   amount
 }) => {
 
+  if (!walletId)
+    throw escrowError('WALLET_ID_REQUIRED');
+
+  if (!amount || Number(amount) <= 0)
+    throw escrowError('INVALID_AMOUNT');
+
+  /* ===============================
+     LOCK WALLET ROW
+  =============================== */
+
   const [[wallet]] = await conn.query(
     `
-    SELECT balance, locked_balance
+    SELECT
+      id,
+      balance,
+      locked_balance
     FROM wallets
     WHERE id = ?
     FOR UPDATE
@@ -19,14 +32,23 @@ exports.lockFunds = async ({
   );
 
   if (!wallet)
-    throw new Error('WALLET_NOT_FOUND');
+    throw escrowError('WALLET_NOT_FOUND');
 
-  const available =
-    Number(wallet.balance)
-    - Number(wallet.locked_balance);
+  const balance = Number(wallet.balance || 0);
+  const locked = Number(wallet.locked_balance || 0);
+  const available = balance - locked;
 
-  if (available < amount)
-    throw new Error('INSUFFICIENT_BALANCE');
+  /* ===============================
+     BALANCE CHECK
+  =============================== */
+
+  if (available < amount) {
+    throw escrowError('INSUFFICIENT_BALANCE');
+  }
+
+  /* ===============================
+     LOCK FUNDS
+  =============================== */
 
   await conn.query(
     `
@@ -34,9 +56,22 @@ exports.lockFunds = async ({
     SET locked_balance = locked_balance + ?
     WHERE id = ?
     `,
-    [amount, walletId]
+    [Number(amount), walletId]
   );
+
+  return true;
 };
+
+
+/* ===============================
+   ERROR HELPER
+=============================== */
+
+function escrowError(code) {
+  const err = new Error(code);
+  err.code = code;
+  return err;
+}
 
 exports.unlockFunds = async ({
   conn,

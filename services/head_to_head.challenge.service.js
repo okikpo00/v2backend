@@ -15,9 +15,9 @@ function serviceError(message) {
 /* =========================================================
    CREATE CHALLENGE
 ========================================================= */
+
 exports.createChallenge = async ({
   userId,
-  walletId,
   questionId,
   stake,
   side
@@ -28,25 +28,31 @@ exports.createChallenge = async ({
 
   if (!stake || stake <= 0)
     throw serviceError('INVALID_STAKE');
-/* ===============================
-   LOAD H2H STAKE LIMITS
-=============================== */
 
-const [minStake, maxStake] = await Promise.all([
-  System.getDecimal('H2H_MIN_STAKE'),
-  System.getDecimal('H2H_MAX_STAKE')
-]);
+  /* ===============================
+     LOAD H2H STAKE LIMITS
+  =============================== */
 
-if (Number(stake) < Number(minStake))
-  throw serviceError('STAKE_BELOW_MINIMUM');
+  const [minStake, maxStake] = await Promise.all([
+    System.getDecimal('H2H_MIN_STAKE'),
+    System.getDecimal('H2H_MAX_STAKE')
+  ]);
 
-if (Number(stake) > Number(maxStake))
-  throw serviceError('STAKE_ABOVE_MAXIMUM');
+  if (Number(stake) < Number(minStake))
+    throw serviceError('STAKE_BELOW_MINIMUM');
+
+  if (Number(stake) > Number(maxStake))
+    throw serviceError('STAKE_ABOVE_MAXIMUM');
+
   const conn = await pool.getConnection();
 
   try {
 
     await conn.beginTransaction();
+
+    /* ===============================
+       LOCK QUESTION
+    =============================== */
 
     const [[question]] = await conn.query(
       `SELECT id, status
@@ -62,22 +68,47 @@ if (Number(stake) > Number(maxStake))
     if (question.status !== 'published')
       throw serviceError('QUESTION_NOT_AVAILABLE');
 
+    /* ===============================
+       LOAD WALLET FROM USER
+    =============================== */
+
     const [[wallet]] = await conn.query(
-      `SELECT id
-       FROM wallets
-       WHERE id = ? AND user_id = ?
-       FOR UPDATE`,
-      [walletId, userId]
+      `
+      SELECT id, balance, locked_balance
+      FROM wallets
+      WHERE user_id = ?
+      AND currency = 'NGN'
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [userId]
     );
 
     if (!wallet)
       throw serviceError('INVALID_WALLET');
+
+    const walletId = wallet.id;
+
+    const balance = Number(wallet.balance || 0);
+    const locked = Number(wallet.locked_balance || 0);
+    const available = balance - locked;
+
+    if (available < stake)
+      throw serviceError('INSUFFICIENT_BALANCE');
+
+    /* ===============================
+       LOCK FUNDS
+    =============================== */
 
     await Escrow.lockFunds({
       conn,
       walletId,
       amount: stake
     });
+
+    /* ===============================
+       CREATE CHALLENGE
+    =============================== */
 
     const uuid = uuidv4();
     const inviteCode = Util.generateInviteCode();
@@ -91,72 +122,70 @@ if (Number(stake) > Number(maxStake))
     );
 
     /* ===============================
-   LOAD USERNAME
-=============================== */
-const [[userRow]] = await conn.query(
-  `
-  SELECT username
-  FROM users
-  WHERE id = ?
-  LIMIT 1
-  `,
-  [userId]
-);
+       LOAD USERNAME
+    =============================== */
 
-const creatorUsername = userRow?.username || null;
+    const [[userRow]] = await conn.query(
+      `SELECT username
+       FROM users
+       WHERE id = ?
+       LIMIT 1`,
+      [userId]
+    );
 
-/* ===============================
-   LOAD PLATFORM FEE
-=============================== */
-const [[feeRow]] = await conn.query(
-  `
-  SELECT value
-  FROM system_settings
-  WHERE \`key\` = 'H2H_FEE_PERCENT'
-  LIMIT 1
-  `
-);
+    const creatorUsername = userRow?.username || null;
 
-const feePercent = Number(feeRow?.value || 0);
+    /* ===============================
+       LOAD PLATFORM FEE
+    =============================== */
 
-const totalPot = stake * 2;
-const platformFee = (totalPot * feePercent) / 100;
-const potentialWin = totalPot - platformFee;
+    const [[feeRow]] = await conn.query(
+      `SELECT value
+       FROM system_settings
+       WHERE \`key\` = 'H2H_FEE_PERCENT'
+       LIMIT 1`
+    );
 
-await conn.commit();
+    const feePercent = Number(feeRow?.value || 0);
 
-return {
-  uuid,
-  invite_code: inviteCode,
+    const totalPot = stake * 2;
+    const platformFee = (totalPot * feePercent) / 100;
+    const potentialWin = totalPot - platformFee;
 
-  stake,
-  total_pot: totalPot,
-  platform_fee: Number(platformFee.toFixed(2)),
-  potential_win: Number(potentialWin.toFixed(2)),
+    await conn.commit();
 
-  status: 'pending',
-  creator_side: side,
-  creator_username: creatorUsername
-};
+    return {
+      uuid,
+      invite_code: inviteCode,
+      stake,
+      total_pot: totalPot,
+      platform_fee: Number(platformFee.toFixed(2)),
+      potential_win: Number(potentialWin.toFixed(2)),
+      status: 'pending',
+      creator_side: side,
+      creator_username: creatorUsername
+    };
 
   } catch (err) {
 
     await conn.rollback();
-    throw err;
+
+    if (err.code) throw err;
+
+    console.error('[CREATE_CHALLENGE_SERVICE_ERROR]', err);
+
+    throw serviceError('CREATE_CHALLENGE_FAILED');
 
   } finally {
 
     conn.release();
+
   }
 
 };
 
-/* =========================================================
-   ACCEPT CHALLENGE
-========================================================= */
 exports.acceptChallenge = async ({
   userId,
-  walletId,
   inviteCode
 }) => {
 
@@ -165,6 +194,10 @@ exports.acceptChallenge = async ({
   try {
 
     await conn.beginTransaction();
+
+    /* ===============================
+       LOAD CHALLENGE
+    =============================== */
 
     const [[challenge]] =
       await conn.query(
@@ -184,6 +217,10 @@ exports.acceptChallenge = async ({
     if (challenge.creator_user_id === userId)
       throw serviceError('CANNOT_ACCEPT_OWN_CHALLENGE');
 
+    /* ===============================
+       LOCK QUESTION
+    =============================== */
+
     const [[question]] =
       await conn.query(
         `SELECT status
@@ -196,16 +233,37 @@ exports.acceptChallenge = async ({
     if (!question || question.status !== 'published')
       throw serviceError('CHALLENGE_EXPIRED');
 
+    /* ===============================
+       LOAD WALLET FROM USER
+    =============================== */
+
     const [[wallet]] = await conn.query(
-      `SELECT id
-       FROM wallets
-       WHERE id = ? AND user_id = ?
-       FOR UPDATE`,
-      [walletId, userId]
+      `
+      SELECT id, balance, locked_balance
+      FROM wallets
+      WHERE user_id = ?
+      AND currency = 'NGN'
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [userId]
     );
 
     if (!wallet)
       throw serviceError('INVALID_WALLET');
+
+    const walletId = wallet.id;
+
+    const balance = Number(wallet.balance || 0);
+    const locked = Number(wallet.locked_balance || 0);
+    const available = balance - locked;
+
+    if (available < challenge.stake)
+      throw serviceError('INSUFFICIENT_BALANCE');
+
+    /* ===============================
+       LOCK FUNDS
+    =============================== */
 
     await Escrow.lockFunds({
       conn,
@@ -213,8 +271,16 @@ exports.acceptChallenge = async ({
       amount: challenge.stake
     });
 
+    /* ===============================
+       DETERMINE OPPONENT SIDE
+    =============================== */
+
     const opponentSide =
       challenge.creator_side === 'yes' ? 'no' : 'yes';
+
+    /* ===============================
+       UPDATE CHALLENGE
+    =============================== */
 
     await conn.query(
       `UPDATE head_to_head_challenges
@@ -227,6 +293,10 @@ exports.acceptChallenge = async ({
       [userId, walletId, opponentSide, challenge.id]
     );
 
+    /* ===============================
+       PLATFORM FEE
+    =============================== */
+
     const [[feeRow]] = await conn.query(
       `SELECT value
        FROM system_settings
@@ -236,6 +306,7 @@ exports.acceptChallenge = async ({
 
     const feePercent = Number(feeRow?.value || 0);
     const stake = Number(challenge.stake);
+
     const totalPot = stake * 2;
     const platformFee = (totalPot * feePercent) / 100;
     const potentialWin = totalPot - platformFee;
@@ -253,11 +324,17 @@ exports.acceptChallenge = async ({
   } catch (err) {
 
     await conn.rollback();
-    throw err;
+
+    if (err.code) throw err;
+
+    console.error('[ACCEPT_CHALLENGE_SERVICE_ERROR]', err);
+
+    throw serviceError('ACCEPT_CHALLENGE_FAILED');
 
   } finally {
 
     conn.release();
+
   }
 
 };

@@ -27,25 +27,50 @@ exports.create = async (req, res) => {
 
   try {
 
-    const { question_id, stake, side } = req.body;
+    const { question_id, stake, side } = req.body || {};
 
-    if (!question_id)
-      return badRequest(res, 'question_id required');
+    /* =====================================================
+       INPUT VALIDATION
+    ===================================================== */
 
-    if (!stake || stake <= 0)
-      return badRequest(res, 'invalid stake');
+    const questionId = Number(question_id);
+    const stakeAmount = Number(stake);
 
-    if (!['yes','no'].includes(side))
-      return badRequest(res, 'invalid side');
-
-    const result =
-      await Service.createChallenge({
-        userId: req.user.id,
-        walletId: req.user.wallet_id,
-        questionId: question_id,
-        stake: Number(stake),
-        side
+    if (!questionId) {
+      return res.status(400).json({
+        success: false,
+        code: 'QUESTION_ID_REQUIRED',
+        message: 'question_id required'
       });
+    }
+
+    if (!stakeAmount || stakeAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_STAKE',
+        message: 'Invalid stake amount'
+      });
+    }
+
+    if (!['yes', 'no'].includes(side)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_SIDE',
+        message: 'Side must be yes or no'
+      });
+    }
+
+    /* =====================================================
+       CREATE CHALLENGE
+    ===================================================== */
+
+    const result = await Service.createChallenge({
+      userId: req.user.id,
+    
+      questionId,
+      stake: stakeAmount,
+      side
+    });
 
     return res.json({
       success: true,
@@ -54,15 +79,78 @@ exports.create = async (req, res) => {
 
   } catch (err) {
 
-    if (err.code)
-      return badRequest(res, err.message);
+    /* =====================================================
+       DEBUG LOGGING
+    ===================================================== */
 
-    return serverError(res, err);
+    console.log('\n========== CREATE CHALLENGE ERROR ==========');
+    console.log('Error object:', err);
+    console.log('Error code:', err?.code);
+    console.log('Error message:', err?.message);
+    console.log('Stack:', err?.stack);
+    console.log('============================================\n');
+
+    /* =====================================================
+       BUSINESS ERRORS
+    ===================================================== */
+
+    if (err.code === 'INSUFFICIENT_BALANCE') {
+      return res.status(409).json({
+        success: false,
+        code: 'INSUFFICIENT_BALANCE',
+        message: 'Insufficient wallet balance'
+      });
+    }
+
+    if (err.code === 'WALLET_NOT_FOUND') {
+      return res.status(404).json({
+        success: false,
+        code: 'WALLET_NOT_FOUND',
+        message: 'Wallet not found'
+      });
+    }
+
+    if (err.code === 'QUESTION_NOT_FOUND') {
+      return res.status(404).json({
+        success: false,
+        code: 'QUESTION_NOT_FOUND',
+        message: 'Question not found'
+      });
+    }
+
+    if (err.code === 'QUESTION_NOT_AVAILABLE') {
+      return res.status(409).json({
+        success: false,
+        code: 'QUESTION_NOT_AVAILABLE',
+        message: 'Challenge is no longer available'
+      });
+    }
+
+    /* =====================================================
+       GENERIC SERVICE ERROR
+    ===================================================== */
+
+    if (err.code) {
+      return res.status(400).json({
+        success: false,
+        code: err.code,
+        message: err.message || 'Request failed'
+      });
+    }
+
+    /* =====================================================
+       UNKNOWN ERROR
+    ===================================================== */
+
+    return res.status(500).json({
+      success: false,
+      code: 'SERVER_ERROR',
+      message: 'Internal server error'
+    });
 
   }
 
 };
-
 /* =========================================================
    ACCEPT CHALLENGE
 ========================================================= */
@@ -70,17 +158,20 @@ exports.accept = async (req, res) => {
 
   try {
 
-    const { invite_code } = req.body;
+    const { invite_code } = req.body || {};
 
-    if (!invite_code)
-      return badRequest(res, 'invite_code required');
-
-    const result =
-      await Service.acceptChallenge({
-        userId: req.user.id,
-        walletId: req.user.wallet_id,
-        inviteCode: invite_code
+    if (!invite_code) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVITE_CODE_REQUIRED',
+        message: 'invite_code required'
       });
+    }
+
+    const result = await Service.acceptChallenge({
+      userId: req.user.id,
+      inviteCode: invite_code
+    });
 
     return res.json({
       success: true,
@@ -89,10 +180,53 @@ exports.accept = async (req, res) => {
 
   } catch (err) {
 
-    if (err.code)
-      return badRequest(res, err.message);
+    console.error('[ACCEPT_CHALLENGE_ERROR]', err);
 
-    return serverError(res, err);
+    if (err.code === 'INSUFFICIENT_BALANCE') {
+      return res.status(409).json({
+        success: false,
+        code: 'INSUFFICIENT_BALANCE',
+        message: 'Insufficient wallet balance'
+      });
+    }
+
+    if (err.code === 'CHALLENGE_NOT_FOUND') {
+      return res.status(404).json({
+        success: false,
+        code: 'CHALLENGE_NOT_FOUND',
+        message: 'Challenge not found'
+      });
+    }
+
+    if (err.code === 'CHALLENGE_NOT_AVAILABLE') {
+      return res.status(409).json({
+        success: false,
+        code: 'CHALLENGE_NOT_AVAILABLE',
+        message: 'Challenge is no longer available'
+      });
+    }
+
+    if (err.code === 'CANNOT_ACCEPT_OWN_CHALLENGE') {
+      return res.status(409).json({
+        success: false,
+        code: 'CANNOT_ACCEPT_OWN_CHALLENGE',
+        message: 'You cannot accept your own challenge'
+      });
+    }
+
+    if (err.code) {
+      return res.status(400).json({
+        success: false,
+        code: err.code,
+        message: err.message
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      code: 'SERVER_ERROR',
+      message: 'Internal server error'
+    });
 
   }
 

@@ -1,6 +1,6 @@
-import Redis from 'ioredis';
-import env from '../config/env.js';
-import { AUTH_CODES } from '../config/security.js';
+const Redis = require('ioredis');
+const env = require('../config/env.js');
+const { AUTH_CODES } = require('../config/security.js');
 
 let redis;
 let redisAvailable = false;
@@ -78,20 +78,26 @@ function createLimiter({ prefix, limit, windowSec }) {
 /* =========================
    EXPORTED LIMITERS
 ========================= */
-export const loginLimiter = createLimiter({
+const loginLimiter = createLimiter({
   prefix: 'rl:login',
   limit: 5,
   windowSec: 600
 });
 
-export const forgotPasswordLimiter = createLimiter({
+const forgotPasswordLimiter = createLimiter({
   prefix: 'rl:forgot',
   limit: 3,
   windowSec: 900
 });
 
-export const resendVerificationLimiter = createLimiter({
+const resendVerificationLimiter = createLimiter({
   prefix: 'rl:verify',
   limit: 3,
   windowSec: 900
 });
+
+module.exports = {
+  loginLimiter,
+  forgotPasswordLimiter,
+  resendVerificationLimiter
+};

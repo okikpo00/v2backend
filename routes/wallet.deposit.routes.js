@@ -26,4 +26,10 @@ router.get(
   requireEmailVerified,
   DepositController.list
 );
+router.post(
+  '/payments/flutterwave/verify',
+   requireAuth,
+  requireEmailVerified,
+  DepositController.verify
+);
 module.exports = router;

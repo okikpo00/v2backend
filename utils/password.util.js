@@ -1,11 +1,16 @@
-import bcrypt from 'bcrypt';
+const bcrypt = require('bcrypt');
 
 const SALT_ROUNDS = 12;
 
-export async function hashPassword(plain) {
+async function hashPassword(plain) {
   return bcrypt.hash(plain, SALT_ROUNDS);
 }
 
-export async function verifyPassword(plain, hash) {
+async function verifyPassword(plain, hash) {
   return bcrypt.compare(plain, hash);
 }
+
+module.exports = {
+  hashPassword,
+  verifyPassword
+};

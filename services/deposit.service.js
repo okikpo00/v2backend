@@ -135,3 +135,135 @@ const dailyMax = await System.getDecimal('MAX_DAILY_DEPOSIT_AMOUNT');
     tx_ref: txRef
   };
 };
+/* =========================================================
+   VERIFY DEPOSIT (MANUAL FALLBACK)
+========================================================= */
+
+exports.verifyDeposit = async ({
+  tx_ref,
+  transaction_id
+}) => {
+
+  if (!tx_ref || !transaction_id) {
+    throw depositError('INVALID_VERIFY_REQUEST');
+  }
+
+  /* =========================
+     VERIFY WITH FLUTTERWAVE
+  ========================= */
+
+  const verifyRes =
+    await Flutterwave.verifyTransaction(transaction_id);
+
+  const data = verifyRes?.data;
+
+  if (!data || data.status !== 'successful') {
+    throw depositError('PAYMENT_NOT_SUCCESSFUL');
+  }
+
+  const conn = await pool.getConnection();
+
+  let deposit;
+
+  try {
+
+    await conn.beginTransaction();
+
+    const [[row]] = await conn.query(
+      `SELECT *
+       FROM deposits
+       WHERE tx_ref = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [tx_ref]
+    );
+
+    if (!row) {
+      throw depositError('DEPOSIT_NOT_FOUND');
+    }
+
+    if (row.status !== 'pending') {
+      await conn.commit();
+      return {
+        status: row.status
+      };
+    }
+
+    /* =========================
+       VALIDATE AMOUNT
+    ========================= */
+
+    if (
+      Number(row.amount) !== Number(data.amount) ||
+      row.currency !== data.currency
+    ) {
+      await conn.query(
+        `UPDATE deposits
+         SET status = 'failed'
+         WHERE id = ?`,
+        [row.id]
+      );
+
+      await conn.commit();
+
+      throw depositError('AMOUNT_MISMATCH');
+    }
+
+    /* =========================
+       MARK SUCCESS
+    ========================= */
+
+    await conn.query(
+      `UPDATE deposits
+       SET status = 'successful',
+           provider_tx_id = ?,
+           verified_at = NOW()
+       WHERE id = ?`,
+      [transaction_id, row.id]
+    );
+
+    deposit = row;
+
+    await conn.commit();
+
+  } catch (e) {
+
+    await conn.rollback();
+    throw e;
+
+  } finally {
+
+    conn.release();
+
+  }
+
+  /* =========================
+     CREDIT WALLET
+  ========================= */
+
+  await WalletService.creditWallet({
+
+    walletId: deposit.wallet_id,
+
+    userId: deposit.user_id,
+
+    amount: Number(deposit.amount),
+
+    source_type: 'deposit',
+
+    source_id: deposit.id,
+
+    idempotency_key: tx_ref,
+
+    metadata: {
+      provider: 'flutterwave',
+      provider_tx_id: transaction_id
+    }
+
+  });
+
+  return {
+    status: 'successful'
+  };
+
+};

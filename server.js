@@ -49,18 +49,23 @@ const app = express();
    CORS CONFIG
 ========================= */
 
-app.use(
-  cors({
-    origin: [
-      'http://localhost:5174', 
-      'http://localhost:5173',// Vite dev
-      'http://localhost:5175'  // future frontend
-    ],
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
-  })
-);
+const allowedOrigins = [
+  'https://trebetta.com',
+  'https://www.trebetta.com',
+  'https://admin.trebetta.com',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175'
+];
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+
+app.options(/.*/, cors());
 // ONLY for webhooks
 app.use(
   '/webhooks',

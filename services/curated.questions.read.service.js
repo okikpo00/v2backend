@@ -85,6 +85,8 @@ exports.getOne = async ({ uuid }) => {
       q.outcome,
       q.start_time,
       q.lock_time,
+      UNIX_TIMESTAMP(q.lock_time) AS closes_at_unix,
+      UNIX_TIMESTAMP(NOW()) AS server_time,
       q.published_at,
       q.created_at,
 
@@ -118,12 +120,24 @@ exports.getOne = async ({ uuid }) => {
 
   if (!row) return null;
 
-  // Clean combo_items (remove null entries)
+  /* ===============================
+     CLEAN COMBO ITEMS
+  =============================== */
+
   if (!row.is_combo) {
     row.combo_items = [];
   } else {
     row.combo_items = (row.combo_items || []).filter(i => i !== null);
   }
+
+  /* ===============================
+     TYPE CLEANING
+  =============================== */
+
+  row.yes_odds = Number(row.yes_odds);
+  row.no_odds = Number(row.no_odds);
+  row.closes_at_unix = Number(row.closes_at_unix);
+  row.server_time = Number(row.server_time);
 
   return row;
 };

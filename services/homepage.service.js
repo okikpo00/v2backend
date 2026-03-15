@@ -19,7 +19,12 @@ async function cacheGet(key) {
 
     if (!data) return null;
 
-    return JSON.parse(data);
+    try {
+      return JSON.parse(data);
+    } catch (parseErr) {
+      console.error('[REDIS PARSE ERROR]', parseErr.message);
+      return null;
+    }
 
   }
   catch (err) {
@@ -132,9 +137,6 @@ async function getStats() {
 /* =========================================================
    CURATED QUESTIONS (COUNTDOWN READY)
 ========================================================= */
-/* =========================================================
-   CURATED QUESTIONS (COUNTDOWN PERFECT)
-========================================================= */
 async function getCategoryQuestions() {
 
   const [rows] = await pool.query(`
@@ -145,16 +147,17 @@ async function getCategoryQuestions() {
       q.category,
       q.yes_odds,
       q.no_odds,
+      q.status,
       q.lock_time,
-      UNIX_TIMESTAMP(q.lock_time) as closes_at_unix,
-      COALESCE(e.yes_liability,0) as yes_liability,
-      COALESCE(e.no_liability,0) as no_liability
+      UNIX_TIMESTAMP(q.lock_time) AS closes_at_unix,
+      UNIX_TIMESTAMP(NOW()) AS server_time,
+      COALESCE(e.yes_liability,0) AS yes_liability,
+      COALESCE(e.no_liability,0) AS no_liability
     FROM curated_questions q
     LEFT JOIN curated_question_exposure e
       ON e.question_id = q.id
     WHERE
-      q.status = 'published'
-      AND q.lock_time > NOW()
+      q.status IN ('published','locked')
     ORDER BY q.lock_time ASC
     LIMIT 100
   `);
@@ -168,13 +171,15 @@ async function getCategoryQuestions() {
 
   for (const r of rows) {
 
-    grouped[r.category]?.push({
+    const item = {
 
       id: r.id,
 
       uuid: r.uuid,
 
       title: r.title,
+
+      status: r.status,
 
       yes_odds: Number(r.yes_odds),
 
@@ -184,19 +189,30 @@ async function getCategoryQuestions() {
 
       total_no_amount: Number(r.no_liability),
 
+      /* RAW LOCK TIME */
+      lock_time: new Date(r.lock_time).toISOString(),
+
       /* PRIMARY COUNTDOWN FIELD */
       closes_at: new Date(r.lock_time).toISOString(),
 
-      /* OPTIONAL: ULTRA FAST COUNTDOWN FIELD */
-      closes_at_unix: Number(r.closes_at_unix)
+      /* FAST COUNTDOWN */
+      closes_at_unix: Number(r.closes_at_unix),
 
-    });
+      /* SERVER SYNC TIME */
+      server_time: Number(r.server_time)
+
+    };
+
+    if (grouped[r.category]) {
+      grouped[r.category].push(item);
+    }
 
   }
 
   return grouped;
 
 }
+
 /* =========================================================
    RECENT ACTIVITY (REAL + FAKE)
 ========================================================= */
@@ -261,8 +277,7 @@ async function getH2HQuestions() {
 
   const [rows] = await pool.query(`
     SELECT
-    id,
-
+      id,
       uuid,
       title,
       description,
@@ -371,46 +386,28 @@ exports.getHomepage = async () => {
   const cached = await cacheGet(CACHE_KEY);
 
   if (cached) {
-
     return cached;
-
   }
 
   /* =============================
      LOAD FROM DATABASE
   ============================= */
   const [
-
     billboards,
-
     stats,
-
     recent_activity,
-
     h2h_questions,
-
     h2h_challenges,
-
     categories,
-
     winner_ticker
-
   ] = await Promise.all([
-
     getBillboards(),
-
     getStats(),
-
     getRecentActivity(),
-
     getH2HQuestions(),
-
     getH2HChallenges(),
-
     getCategoryQuestions(),
-
     getWinners()
-
   ]);
 
   const result = {
@@ -437,13 +434,9 @@ exports.getHomepage = async () => {
      SAVE CACHE
   ============================= */
   await cacheSet(
-
     CACHE_KEY,
-
     result,
-
     CACHE_TTL
-
   );
 
   return result;

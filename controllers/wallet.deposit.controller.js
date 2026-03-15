@@ -133,3 +133,44 @@ exports.list = async (req, res) => {
     });
   }
 };
+/* =========================================================
+   VERIFY DEPOSIT
+========================================================= */
+
+exports.verify = async (req, res) => {
+
+  try {
+
+    const { tx_ref, transaction_id } = req.body;
+
+    if (!tx_ref || !transaction_id) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_VERIFY_REQUEST'
+      });
+    }
+
+    const result =
+      await DepositService.verifyDeposit({
+        tx_ref,
+        transaction_id
+      });
+
+    return res.json({
+      success: true,
+      data: result
+    });
+
+  } catch (err) {
+
+    console.error('[DEPOSIT_VERIFY_ERROR]', err);
+
+    return res.status(400).json({
+      success: false,
+      code: err.code || 'VERIFY_FAILED',
+      message: err.message
+    });
+
+  }
+
+};
