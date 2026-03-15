@@ -39,7 +39,17 @@ exports.handle = async (req, res) => {
     return res.status(401).end();
   }
 
-  const payload = req.body;
+ let payload;
+
+try {
+  payload =
+    typeof req.body === 'string'
+      ? JSON.parse(req.body)
+      : JSON.parse(req.body.toString());
+} catch (err) {
+  console.error('[FLW_WEBHOOK_INVALID_JSON]');
+  return res.status(200).end();
+}
 
   if (
     payload?.event !== 'charge.completed' ||
