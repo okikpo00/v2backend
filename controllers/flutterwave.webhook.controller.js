@@ -29,6 +29,11 @@ function timingSafeEqual(a, b) {
 
 exports.handle = async (req, res) => {
 
+
+  console.log('[FLUTTERWAVE_WEBHOOK_HIT]', {
+    url: req.originalUrl,
+    ip: req.ip
+  });
   /* =====================================================
      SIGNATURE CHECK
   ===================================================== */
