@@ -151,12 +151,12 @@ exports.handle = async (req, res) => {
 
     await conn.query(
       `
-      UPDATE deposits
-      SET status='successful',
-          provider_tx_id=?,
-          verified_at=NOW(),
-          raw_webhook=?
-      WHERE id=?
+    UPDATE deposits
+SET status = 'completed',
+    provider_tx_id = ?,
+    verified_at = NOW(),
+    metadata = ?
+WHERE id = ?
       `,
       [providerTxId, JSON.stringify(payload), deposit.id]
     );

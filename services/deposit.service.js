@@ -215,10 +215,10 @@ exports.verifyDeposit = async ({
 
     await conn.query(
       `UPDATE deposits
-       SET status = 'successful',
-           provider_tx_id = ?,
-           verified_at = NOW()
-       WHERE id = ?`,
+SET status = 'completed',
+    provider_tx_id = ?,
+    verified_at = NOW()
+WHERE id = ?`,
       [transaction_id, row.id]
     );
 
