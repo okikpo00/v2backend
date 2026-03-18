@@ -365,19 +365,46 @@ setImmediate(async () => {
   try {
     const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${raw}`;
 
-    await sendEmail(
-      emailNorm,
-      'Verify your Trebetta email',
-      `
-        <div style="font-family: Arial, sans-serif">
-          <p>Please verify your email to continue using Trebetta.</p>
-          <p>
-            <a href="${verifyUrl}">${verifyUrl}</a>
-          </p>
-          <p>This link expires in 2 hours.</p>
-        </div>
-      `
-    );
+  await sendEmail(
+  emailNorm,
+  'Verify your Trebetta email',
+  `
+  <div style="font-family: Arial, sans-serif">
+
+    <h2>Welcome to Trebetta 👋</h2>
+
+    <p>Please verify your email to activate your account.</p>
+
+    <!-- BUTTON -->
+    <p>
+      <a href="${verifyUrl}"
+         style="
+           display:inline-block;
+           padding:12px 18px;
+           background:#8A1C1C;
+           color:#ffffff;
+           text-decoration:none;
+           border-radius:6px;
+           font-weight:bold;
+         ">
+         Verify Email
+      </a>
+    </p>
+
+    <!-- FALLBACK -->
+    <p style="margin-top:20px;">
+      If the button doesn't work, copy and paste this link into your browser:
+    </p>
+
+    <p style="word-break: break-all;">
+      ${verifyUrl}
+    </p>
+
+    <p>This link expires in 2 hours.</p>
+
+  </div>
+  `
+);
   } catch (e) {
     console.warn('[SEND_VERIFY] email failed:', e?.message);
   }
