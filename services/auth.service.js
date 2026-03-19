@@ -364,8 +364,7 @@ exports.sendVerification = async ({ email, ip, user_agent }) => {
 setImmediate(async () => {
   try {
     const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${raw}`;
-
-  await sendEmail(
+await sendEmail(
   emailNorm,
   'Verify your Trebetta email',
   `
@@ -373,32 +372,19 @@ setImmediate(async () => {
 
     <h2>Welcome to Trebetta 👋</h2>
 
-    <p>Please verify your email to activate your account.</p>
+    <p>Verify your email to activate your account.</p>
 
-    <!-- BUTTON -->
-    <p>
-      <a href="${verifyUrl}"
-         style="
-           display:inline-block;
-           padding:12px 18px;
-           background:#8A1C1C;
-           color:#ffffff;
-           text-decoration:none;
-           border-radius:6px;
-           font-weight:bold;
-         ">
-         Verify Email
-      </a>
-    </p>
-
-    <!-- FALLBACK -->
-    <p style="margin-top:20px;">
-      If the button doesn't work, copy and paste this link into your browser:
-    </p>
+    <p><b>Step 1:</b> Tap the link below</p>
 
     <p style="word-break: break-all;">
       ${verifyUrl}
     </p>
+
+    <p><b>Step 2:</b> If it doesn't open:</p>
+    <ul>
+      <li>Press and hold the link</li>
+      <li>Select <b>"Open in browser"</b></li>
+    </ul>
 
     <p>This link expires in 2 hours.</p>
 
