@@ -251,23 +251,33 @@ if (dup.length) {
 setImmediate(async () => {
   try {
     const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${rawVerifyToken}`;
+await sendEmail(
+  emailNorm,
+  'Verify your Trebetta account',
+  `
+  <div style="font-family: Arial, sans-serif">
 
-    await sendEmail(
-      emailNorm,
-      'Verify your Trebetta account',
-      `
-        <div style="font-family: Arial, sans-serif">
-          <h2>Welcome to Trebetta 👋</h2>
-          <p>Please verify your email to activate your account.</p>
-          <p>
-            <a href="${verifyUrl}" style="color:#fff;background:#8b0000;padding:10px 16px;text-decoration:none;border-radius:4px">
-              Verify Email
-            </a>
-          </p>
-          <p>This link expires in 2 hours.</p>
-        </div>
-      `
-    );
+    <h2>Welcome to Trebetta 👋</h2>
+
+    <p>Please verify your email to activate your account.</p>
+
+    <p><b>Step 1:</b> Tap the link below</p>
+
+    <p style="word-break: break-all;">
+      ${verifyUrl}
+    </p>
+
+    <p><b>Step 2:</b> If it doesn’t open:</p>
+    <ul>
+      <li>Press and hold the link</li>
+      <li>Select <b>"Open in browser"</b></li>
+    </ul>
+
+    <p>This link expires in 2 hours.</p>
+
+  </div>
+  `
+);
   } catch (e) {
     console.warn('[REGISTER] verification email failed:', e?.message);
   }
