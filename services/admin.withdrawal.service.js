@@ -41,7 +41,7 @@ exports.listPending = async () => {
 };
 
 /* =========================================================
-   APPROVE WITHDRAWAL
+   APPROVE WITHDRAWAL (FIXED - PRODUCTION SAFE)
 ========================================================= */
 exports.approve = async ({
   adminId,
@@ -68,7 +68,9 @@ exports.approve = async ({
       throw adminWithdrawalError('INVALID_WITHDRAWAL');
     }
 
-    // Debit wallet (amount + fee already locked)
+    /* =========================
+       STEP 1: DEBIT WALLET
+    ========================= */
     await WalletService.debitWallet({
       walletId: withdrawal.wallet_id,
       userId: withdrawal.user_id,
@@ -81,6 +83,17 @@ exports.approve = async ({
       }
     });
 
+    /* =========================
+       STEP 2: UNLOCK FUNDS (CRITICAL FIX)
+    ========================= */
+    await WalletService.unlockFunds({
+      walletId: withdrawal.wallet_id,
+      amount: withdrawal.total_debit
+    });
+
+    /* =========================
+       STEP 3: UPDATE STATUS
+    ========================= */
     await conn.query(
       `UPDATE withdrawal_requests
        SET status = 'approved',
@@ -90,6 +103,9 @@ exports.approve = async ({
       [adminId, withdrawal.id]
     );
 
+    /* =========================
+       STEP 4: AUDIT LOG
+    ========================= */
     await conn.query(
       `INSERT INTO admin_audit_logs
        (admin_id, actor_role, action, target_type, target_id, ip_address, user_agent)
@@ -98,9 +114,17 @@ exports.approve = async ({
     );
 
     await conn.commit();
+
+    console.log('[WITHDRAW_APPROVED_SUCCESS]', {
+      withdrawal_uuid,
+      amount: withdrawal.total_debit
+    });
+
     return { success: true };
+
   } catch (e) {
     await conn.rollback();
+    console.error('[WITHDRAW_APPROVE_ERROR]', e);
     throw e;
   } finally {
     conn.release();
