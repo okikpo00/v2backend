@@ -439,15 +439,17 @@ exports.unlockFunds = async ({ walletId, amount }) => {
     );
 
     if (!wallet) throw walletError('WALLET_NOT_FOUND');
-    if (wallet.locked_balance < amount) {
-      throw walletError('INVALID_UNLOCK_AMOUNT');
-    }
+
+    const currentLocked = Number(wallet.locked_balance);
+
+    // ✅ SAFE CALCULATION (NO NEGATIVE EVER)
+    const newLocked = Math.max(currentLocked - Number(amount), 0);
 
     await conn.query(
       `UPDATE wallets
-       SET locked_balance = locked_balance - ?
+       SET locked_balance = ?
        WHERE id = ?`,
-      [amount, walletId]
+      [newLocked, walletId]
     );
 
     await conn.commit();
