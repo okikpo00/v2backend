@@ -109,12 +109,16 @@ if (Number(stake) > Number(maxStake)) {
       throw entryError('INSUFFICIENT_BALANCE');
     }
 
-    await conn.query(
-      `UPDATE wallets
-       SET locked_balance = locked_balance + ?
-       WHERE id = ?`,
-      [Number(stake), wallet.id]
-    );
+ const WalletService = require('./wallet.service');
+
+await WalletService.debitWallet({
+  walletId: wallet.id,
+  userId,
+  amount: Number(stake),
+  source_type: 'stake',
+  source_id: slipUuid,
+  idempotency_key: `stake:${slipUuid}`
+});
 const [[userRow]] = await conn.query(
   `
   SELECT username
