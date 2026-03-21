@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const { validateEntryPayload } = require('../validators/curated.entry.validator');
 const OddsEngine = require('./odds.engine.service');
 const System = require('./system.service');
+ const slipUuid = uuidv4();
 /* =========================
    ERROR HELPER
 ========================= */
@@ -109,7 +110,7 @@ if (Number(stake) > Number(maxStake)) {
       throw entryError('INSUFFICIENT_BALANCE');
     }
 
- const WalletService = require('./wallet.service');
+  const WalletService = require('./wallet.service');
 
 await WalletService.debitWallet({
   walletId: wallet.id,
@@ -134,7 +135,7 @@ const username = userRow?.username || 'User';
        CREATE SLIP (ODDS & PAYOUT CALCULATED BELOW)
     ===================================================== */
     
-    const slipUuid = uuidv4();
+   
     let totalOdds = 1;
 
     const [slipRes] = await conn.query(
