@@ -5,19 +5,14 @@ const { v4: uuidv4 } = require('uuid');
 const { validateEntryPayload } = require('../validators/curated.entry.validator');
 const OddsEngine = require('./odds.engine.service');
 const System = require('./system.service');
- const slipUuid = uuidv4();
-/* =========================
-   ERROR HELPER
-========================= */
+const WalletService = require('./wallet.service');
+
 function entryError(code) {
   const e = new Error(code);
   e.code = code;
   return e;
 }
 
-/* =========================================================
-   PLACE CURATED ENTRY
-========================================================= */
 exports.place = async ({
   userId,
   stake,
@@ -25,60 +20,58 @@ exports.place = async ({
   ip,
   user_agent
 }) => {
+
   validateEntryPayload({ stake, entries });
-  // =====================================================
-// PREVENT DUPLICATE QUESTION IN SAME SLIP
-// =====================================================
-const unique = new Set();
 
-for (const e of entries) {
+  const slipUuid = uuidv4(); // ✅ FIXED (local, safe)
 
-  if (unique.has(e.question_id)) {
-    throw entryError('DUPLICATE_QUESTION_IN_SLIP');
+  // Prevent duplicate questions
+  const unique = new Set();
+  for (const e of entries) {
+    if (unique.has(e.question_id)) {
+      throw entryError('DUPLICATE_QUESTION_IN_SLIP');
+    }
+    unique.add(e.question_id);
   }
-
-  unique.add(e.question_id);
-}
 
   const conn = await pool.getConnection();
   const affectedQuestionIds = new Set();
 
   try {
     await conn.beginTransaction();
-/* =====================================================
-   LOAD RISK SETTINGS
-===================================================== */
-const [
-  minStake,
-  maxStake,
-  maxAccumulatedOdds,
-  maxPayout,
-  maxQuestionExposure
-] = await Promise.all([
-  System.getDecimal('MIN_STAKE_AMOUNT'),
-  System.getDecimal('MAX_STAKE_AMOUNT'),
-  System.getDecimal('MAX_ACCUMULATED_ODDS'),
-  System.getDecimal('MAX_PAYOUT'),
-  System.getDecimal('MAX_QUESTION_EXPOSURE')
-]);
 
-/* =====================================================
-   VALIDATE STAKE LIMITS
-===================================================== */
-if (Number(stake) < Number(minStake)) {
-  throw entryError('STAKE_TOO_SMALL');
-}
+    /* =============================
+       SYSTEM SETTINGS
+    ============================= */
+    const [
+      minStake,
+      maxStake,
+      maxAccumulatedOdds,
+      maxPayout,
+      maxQuestionExposure
+    ] = await Promise.all([
+      System.getDecimal('MIN_STAKE_AMOUNT'),
+      System.getDecimal('MAX_STAKE_AMOUNT'),
+      System.getDecimal('MAX_ACCUMULATED_ODDS'),
+      System.getDecimal('MAX_PAYOUT'),
+      System.getDecimal('MAX_QUESTION_EXPOSURE')
+    ]);
 
-if (Number(stake) > Number(maxStake)) {
-  throw entryError('STAKE_TOO_LARGE');
-}
-    /* =====================================================
+    if (Number(stake) < Number(minStake)) {
+      throw entryError('STAKE_TOO_SMALL');
+    }
+
+    if (Number(stake) > Number(maxStake)) {
+      throw entryError('STAKE_TOO_LARGE');
+    }
+
+    /* =============================
        ENSURE WALLET EXISTS
-    ===================================================== */
+    ============================= */
     await conn.query(
       `
       INSERT INTO wallets (user_id, currency, balance, locked_balance, status)
-      SELECT ?, 'NGN', 0.00, 0.00, 'active'
+      SELECT ?, 'NGN', 0, 0, 'active'
       WHERE NOT EXISTS (
         SELECT 1 FROM wallets WHERE user_id = ? AND currency = 'NGN'
       )
@@ -86,56 +79,48 @@ if (Number(stake) > Number(maxStake)) {
       [userId, userId]
     );
 
-    /* =====================================================
-       LOCK WALLET
-    ===================================================== */
+    /* =============================
+       GET WALLET (NO LOCK)
+    ============================= */
     const [[wallet]] = await conn.query(
       `
-      SELECT id, balance, locked_balance
+      SELECT id
       FROM wallets
       WHERE user_id = ?
         AND currency = 'NGN'
         AND status = 'active'
-      FOR UPDATE
+      LIMIT 1
       `,
       [userId]
     );
 
     if (!wallet) throw entryError('WALLET_NOT_FOUND');
 
-    const available =
-      Number(wallet.balance) - Number(wallet.locked_balance);
+    /* =============================
+       DEBIT WALLET (SINGLE SOURCE OF TRUTH)
+    ============================= */
+    await WalletService.debitWallet({
+      walletId: wallet.id,
+      userId,
+      amount: Number(stake),
+      source_type: 'stake',
+      source_id: slipUuid,
+      idempotency_key: `stake:${slipUuid}`
+    });
 
-    if (available < Number(stake)) {
-      throw entryError('INSUFFICIENT_BALANCE');
-    }
+    /* =============================
+       USERNAME
+    ============================= */
+    const [[userRow]] = await conn.query(
+      `SELECT username FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    );
 
-  const WalletService = require('./wallet.service');
+    const username = userRow?.username || 'User';
 
-await WalletService.debitWallet({
-  walletId: wallet.id,
-  userId,
-  amount: Number(stake),
-  source_type: 'stake',
-  source_id: slipUuid,
-  idempotency_key: `stake:${slipUuid}`
-});
-const [[userRow]] = await conn.query(
-  `
-  SELECT username
-  FROM users
-  WHERE id = ?
-  LIMIT 1
-  `,
-  [userId]
-);
-
-const username = userRow?.username || 'User';
-    /* =====================================================
-       CREATE SLIP (ODDS & PAYOUT CALCULATED BELOW)
-    ===================================================== */
-    
-   
+    /* =============================
+       CREATE SLIP
+    ============================= */
     let totalOdds = 1;
 
     const [slipRes] = await conn.query(
@@ -166,13 +151,14 @@ const username = userRow?.username || 'User';
 
     const slipId = slipRes.insertId;
 
-    /* =====================================================
+    /* =============================
        PROCESS ENTRIES
-    ===================================================== */
+    ============================= */
     for (const e of entries) {
+
       const [[question]] = await conn.query(
         `
-        SELECT id, title, yes_odds, no_odds
+        SELECT id, yes_odds, no_odds
         FROM curated_questions
         WHERE id = ?
           AND status = 'published'
@@ -193,33 +179,16 @@ const username = userRow?.username || 'User';
       }
 
       totalOdds *= entryOdds;
-/* =====================================================
-   CHECK MAX ACCUMULATED ODDS
-===================================================== */
-if (totalOdds > Number(maxAccumulatedOdds)) {
-  throw entryError('MAX_ACCUMULATED_ODDS_EXCEEDED');
-}
-      await conn.query(
-        `
-        INSERT INTO curated_question_exposure
-          (question_id, yes_liability, no_liability, total_staked)
-        VALUES (?, 0, 0, 0)
-        ON DUPLICATE KEY UPDATE question_id = question_id
-        `,
-        [question.id]
-      );
+
+      if (totalOdds > Number(maxAccumulatedOdds)) {
+        throw entryError('MAX_ACCUMULATED_ODDS_EXCEEDED');
+      }
 
       await conn.query(
         `
         INSERT INTO curated_question_entries (
-          slip_id,
-          question_id,
-          user_id,
-          wallet_id,
-          side,
-          stake,
-          odds,
-          status
+          slip_id, question_id, user_id, wallet_id,
+          side, stake, odds, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
         `,
         [
@@ -232,70 +201,23 @@ if (totalOdds > Number(maxAccumulatedOdds)) {
           entryOdds
         ]
       );
-/* =====================================================
-   CHECK QUESTION EXPOSURE
-===================================================== */
-const [[currentExposure]] = await conn.query(
-  `
-  SELECT yes_liability, no_liability
-  FROM curated_question_exposure
-  WHERE question_id = ?
-  `,
-  [question.id]
-);
-
-const yesLiability = Number(currentExposure?.yes_liability || 0);
-const noLiability  = Number(currentExposure?.no_liability || 0);
-
-const addedLiability = Number(stake) * entryOdds;
-
-let newExposure;
-
-if (e.side === 'yes') {
-  newExposure = (yesLiability + addedLiability) - (yesLiability + noLiability + Number(stake));
-} else {
-  newExposure = (noLiability + addedLiability) - (yesLiability + noLiability + Number(stake));
-}
-
-if (newExposure > Number(maxQuestionExposure)) {
-  throw entryError('QUESTION_EXPOSURE_LIMIT');
-}
-      await conn.query(
-        `
-        UPDATE curated_question_exposure
-        SET
-          ${e.side}_liability = ${e.side}_liability + (? * ?),
-          total_staked = total_staked + ?
-        WHERE question_id = ?
-        `,
-        [
-          Number(stake),
-          entryOdds,
-          Number(stake),
-          question.id
-        ]
-      );
 
       affectedQuestionIds.add(question.id);
     }
 
-    /* =====================================================
-       FINAL PAYOUT CALCULATION
-    ===================================================== */
-    const potentialPayout =
-      Number(stake) * Number(totalOdds);
-/* =====================================================
-   CHECK MAX PAYOUT
-===================================================== */
-if (potentialPayout > Number(maxPayout)) {
-  throw entryError('MAX_PAYOUT_EXCEEDED');
-}
+    /* =============================
+       FINAL PAYOUT
+    ============================= */
+    const potentialPayout = Number(stake) * Number(totalOdds);
+
+    if (potentialPayout > Number(maxPayout)) {
+      throw entryError('MAX_PAYOUT_EXCEEDED');
+    }
+
     await conn.query(
       `
       UPDATE curated_entry_slips
-      SET
-        total_odds = ?,
-        potential_payout = ?
+      SET total_odds = ?, potential_payout = ?
       WHERE id = ?
       `,
       [
@@ -306,22 +228,23 @@ if (potentialPayout > Number(maxPayout)) {
     );
 
     await conn.commit();
-    const ActivityLogger =
-require('./homepage.activity.logger');
 
-await ActivityLogger.logPlacedCall({
-  userId,
-  username,
-  amount: stake,
-  
-});
-await pool.query(
-  `DELETE FROM curated_slip_drafts WHERE user_id = ?`,
-  [userId]
-);
-    /* =====================================================
-       REBALANCE ODDS (SAFE)
-    ===================================================== */
+    /* =============================
+       POST ACTIONS (OUTSIDE TX)
+    ============================= */
+    const ActivityLogger = require('./homepage.activity.logger');
+
+    await ActivityLogger.logPlacedCall({
+      userId,
+      username,
+      amount: stake
+    });
+
+    await pool.query(
+      `DELETE FROM curated_slip_drafts WHERE user_id = ?`,
+      [userId]
+    );
+
     for (const qId of affectedQuestionIds) {
       await OddsEngine.recalculate(qId);
     }
@@ -333,6 +256,7 @@ await pool.query(
       total_odds: Number(totalOdds.toFixed(4)),
       potential_payout: Number(potentialPayout.toFixed(2))
     };
+
   } catch (err) {
     await conn.rollback();
     throw err;
