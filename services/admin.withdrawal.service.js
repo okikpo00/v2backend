@@ -67,7 +67,14 @@ exports.approve = async ({
     if (!withdrawal) {
       throw adminWithdrawalError('INVALID_WITHDRAWAL');
     }
-
+  /* =========================
+       STEP 2: UNLOCK FUNDS (CRITICAL FIX)
+    ========================= */
+    await WalletService.unlockFunds({
+      walletId: withdrawal.wallet_id,
+      amount: withdrawal.total_debit
+    });
+    
     /* =========================
        STEP 1: DEBIT WALLET
     ========================= */
@@ -83,13 +90,7 @@ exports.approve = async ({
       }
     });
 
-    /* =========================
-       STEP 2: UNLOCK FUNDS (CRITICAL FIX)
-    ========================= */
-    await WalletService.unlockFunds({
-      walletId: withdrawal.wallet_id,
-      amount: withdrawal.total_debit
-    });
+  
 
     /* =========================
        STEP 3: UPDATE STATUS
