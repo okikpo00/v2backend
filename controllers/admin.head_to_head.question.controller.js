@@ -81,9 +81,7 @@ exports.lock = async (req, res) => {
 };
 
 
-'use strict';
 
-const Service = require('../services/head_to_head.settlement.service');
 
 /* =========================
    HELPERS

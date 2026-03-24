@@ -1,16 +1,4 @@
-'use strict';
 
-const pool = require('../config/db');
-const System = require('./system.service');
-const Escrow = require('./head_to_head.escrow.service');
-const Util = require('../utils/head_to_head.util');
-const { v4: uuidv4 } = require('uuid');
-
-function serviceError(message) {
-  const err = new Error(message);
-  err.code = message;
-  return err;
-}
 
 'use strict';
 

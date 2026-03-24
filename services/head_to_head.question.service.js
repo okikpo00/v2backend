@@ -2,6 +2,7 @@
 
 const pool = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
+const WalletService = require('./wallet.service');
 
 function serviceError(code, message) {
   const err = new Error(message || code);
@@ -174,10 +175,7 @@ exports.lock = async ({ id, adminId, ip, userAgent }) => {
 /* =========================================================
    SETTLE QUESTION (PRODUCTION SAFE)
 ========================================================= */
-'use strict';
 
-const pool = require('../config/db');
-const WalletService = require('./wallet.service');
 
 function serviceError(code) {
   const e = new Error(code);
