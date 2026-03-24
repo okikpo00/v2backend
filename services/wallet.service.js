@@ -1,32 +1,10 @@
 'use strict';
 
-/**
- * =========================================================
- * WALLET SERVICE (SYSTEM-AWARE, LEDGERED, IDEMPOTENT)
- * =========================================================
- * - Atomic balance updates (FOR UPDATE)
- * - Full ledger via wallet_transactions
- * - Redis idempotency (24h)
- * - System rules enforcement (deposits, withdrawals, fees)
- * - Safe under concurrency
- * =========================================================
- */
-
 const pool = require('../config/db');
-const { redis, isRedisAvailable } = require('../config/redis');
-const System = require('./system.service');
-const NotificationService = require('./notification.service');
-
-/* =========================
-   CONSTANTS
-========================= */
-
-const IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24; // 24 hours
 
 /* =========================
    ERROR HELPER
 ========================= */
-
 function walletError(code, message) {
   const err = new Error(message || code);
   err.code = code;
@@ -34,55 +12,36 @@ function walletError(code, message) {
 }
 
 /* =========================
-   IDEMPOTENCY (REDIS)
+   INTERNAL: GET WALLET (LOCKED)
 ========================= */
-
-async function acquireIdempotency(key) {
-  if (!key || !isRedisAvailable()) return;
-
-  const redisKey = `wallet:idempotency:${key}`;
-  const ok = await redis.set(
-    redisKey,
-    '1',
-    'NX',
-    'EX',
-    IDEMPOTENCY_TTL_SECONDS
-  );
-
-  if (!ok) {
-    throw walletError('DUPLICATE_TRANSACTION', 'Duplicate wallet operation');
-  }
-}
-
-async function releaseIdempotency(key) {
-  if (!key || !isRedisAvailable()) return;
-  await redis.del(`wallet:idempotency:${key}`);
-}
-
-/* =========================
-   GET WALLET
-========================= */
-
-exports.getWalletByUser = async ({ userId, currency = 'NGN' }) => {
-  const [[wallet]] = await pool.query(
-    `SELECT id, user_id, currency, balance, locked_balance, status
+async function getWalletForUpdate(conn, walletId) {
+  const [[wallet]] = await conn.query(
+    `SELECT id, user_id, balance, locked_balance, status
      FROM wallets
-     WHERE user_id = ? AND currency = ?
-     LIMIT 1`,
-    [userId, currency]
+     WHERE id = ?
+     FOR UPDATE`,
+    [walletId]
   );
 
-  if (!wallet) {
-    throw walletError('WALLET_NOT_FOUND');
-  }
+  if (!wallet) throw walletError('WALLET_NOT_FOUND');
+  if (wallet.status !== 'active') throw walletError('WALLET_FROZEN');
 
   return wallet;
-};
+}
 
 /* =========================
-   CREATE WALLET (SAFE / IDEMPOTENT)
+   INTERNAL: TX HANDLER
 ========================= */
+function resolveConn(externalConn) {
+  return {
+    conn: externalConn || null,
+    isExternal: !!externalConn
+  };
+}
 
+/* =========================
+   CREATE WALLET
+========================= */
 exports.createWalletIfNotExists = async ({ userId, currency = 'NGN' }) => {
   const conn = await pool.getConnection();
 
@@ -90,9 +49,7 @@ exports.createWalletIfNotExists = async ({ userId, currency = 'NGN' }) => {
     await conn.beginTransaction();
 
     const [[existing]] = await conn.query(
-      `SELECT id FROM wallets
-       WHERE user_id = ? AND currency = ?
-       LIMIT 1`,
+      `SELECT id FROM wallets WHERE user_id = ? AND currency = ? LIMIT 1`,
       [userId, currency]
     );
 
@@ -102,14 +59,14 @@ exports.createWalletIfNotExists = async ({ userId, currency = 'NGN' }) => {
     }
 
     const [res] = await conn.query(
-      `INSERT INTO wallets
-       (user_id, currency, balance, locked_balance, status)
-       VALUES (?, ?, 0.00, 0.00, 'active')`,
+      `INSERT INTO wallets (user_id, currency, balance, locked_balance, status)
+       VALUES (?, ?, 0, 0, 'active')`,
       [userId, currency]
     );
 
     await conn.commit();
     return res.insertId;
+
   } catch (e) {
     await conn.rollback();
     throw e;
@@ -119,344 +76,324 @@ exports.createWalletIfNotExists = async ({ userId, currency = 'NGN' }) => {
 };
 
 /* =========================
-   CREDIT WALLET
-   (Deposits, Admin Credits, Promos)
+   CREDIT
 ========================= */
-
-exports.creditWallet = async ({
+exports.credit = async ({
   walletId,
   userId,
   amount,
-  source_type,
-  source_id,
+  reference_type,
+  reference_id,
   idempotency_key,
-  metadata = null
+  metadata = null,
+  conn: externalConn
 }) => {
-  if (!amount || amount <= 0) {
-    throw walletError('INVALID_AMOUNT');
-  }
 
-  /* ---------- SYSTEM RULES ---------- */
+  if (!amount || amount <= 0) throw walletError('INVALID_AMOUNT');
+  if (!idempotency_key) throw walletError('IDEMPOTENCY_REQUIRED');
 
-  await System.assertEnabled('DEPOSITS_ENABLED');
-
-  if (source_type === 'deposit') {
-    const minDeposit = await System.getDecimal('MIN_DEPOSIT_AMOUNT');
-    if (amount < minDeposit) {
-      throw walletError(
-        'BELOW_MIN_DEPOSIT',
-        `Minimum deposit is ${minDeposit}`
-      );
-    }
-  }
-
-  await acquireIdempotency(idempotency_key);
-
-  const conn = await pool.getConnection();
+  const { conn, isExternal } = resolveConn(externalConn);
+  const connection = conn || await pool.getConnection();
 
   try {
-    await conn.beginTransaction();
+    if (!isExternal) await connection.beginTransaction();
 
-    const [[wallet]] = await conn.query(
-      `SELECT balance, locked_balance, status
-       FROM wallets
-       WHERE id = ?
-       FOR UPDATE`,
-      [walletId]
-    );
-
-    if (!wallet) throw walletError('WALLET_NOT_FOUND');
-    if (wallet.status !== 'active') throw walletError('WALLET_FROZEN');
+    const wallet = await getWalletForUpdate(connection, walletId);
 
     const before = Number(wallet.balance);
     const after = before + Number(amount);
 
-    const [tx] = await conn.query(
+    await connection.query(
       `INSERT INTO wallet_transactions (
-        wallet_id,
-        user_id,
-        type,
-        amount,
-        balance_before,
-        balance_after,
-        source_type,
-        source_id,
-        idempotency_key,
-        metadata
-      ) VALUES (?, ?, 'credit', ?, ?, ?, ?, ?, ?, ?)`,
+        wallet_id, user_id, type, amount,
+        balance_before, balance_after,
+        locked_before, locked_after,
+        source_type, source_id,
+        idempotency_key, metadata
+      ) VALUES (?, ?, 'credit', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         walletId,
         userId,
         amount,
         before,
         after,
-        source_type,
-        source_id || null,
-        idempotency_key || null,
+        wallet.locked_balance,
+        wallet.locked_balance,
+        reference_type,
+        reference_id,
+        idempotency_key,
         metadata ? JSON.stringify(metadata) : null
       ]
     );
 
-    await conn.query(
+    await connection.query(
       `UPDATE wallets SET balance = ? WHERE id = ?`,
       [after, walletId]
     );
 
-   await conn.commit();
-
-/* =========================
-   USER NOTIFICATION
-========================= */
-await NotificationService.createNotification({
-  userId,
-  type: source_type,
-  title:
-    source_type === 'deposit'
-      ? 'Deposit successful'
-      : source_type === 'admin_credit'
-      ? 'Wallet credited'
-      : 'Wallet update',
-  message:
-    source_type === 'deposit'
-      ? `₦${amount} has been added to your wallet`
-      : source_type === 'admin_credit'
-      ? `₦${amount} credited by admin`
-      : `₦${amount} credited`,
-  reference_type: 'wallet_transaction',
-  reference_id: tx.insertId
-});
-
-return tx.insertId;
+    if (!isExternal) await connection.commit();
 
   } catch (e) {
-    await conn.rollback();
-    await releaseIdempotency(idempotency_key);
+    if (!isExternal) await connection.rollback();
+
+    if (e.code === 'ER_DUP_ENTRY') {
+      throw walletError('DUPLICATE_TRANSACTION');
+    }
+
     throw e;
+
   } finally {
-    conn.release();
+    if (!isExternal) connection.release();
   }
 };
 
-
 /* =========================
-   DEBIT WALLET
-   (Withdrawals, Bets, Transfers)
+   LOCK
 ========================= */
-
-exports.debitWallet = async ({
+exports.lock = async ({
   walletId,
   userId,
   amount,
-  source_type,
-  source_id,
+  reference_type,
+  reference_id,
   idempotency_key,
-  metadata = null
+  conn: externalConn
 }) => {
-  if (!amount || amount <= 0) {
-    throw walletError('INVALID_AMOUNT');
-  }
 
-  /* ---------- SYSTEM RULES ---------- */
+  if (!amount || amount <= 0) throw walletError('INVALID_AMOUNT');
+  if (!idempotency_key) throw walletError('IDEMPOTENCY_REQUIRED');
 
-  await System.assertEnabled('WITHDRAWALS_ENABLED');
-
-  let totalDebit = Number(amount);
-  let fee = 0;
-
-  if (source_type === 'withdrawal') {
-    const percentFee = await System.getDecimal('WITHDRAWAL_FEE_PERCENT');
-    const flatFee = await System.getDecimal('WITHDRAWAL_FLAT_FEE');
-
-    fee = (amount * percentFee) / 100 + flatFee;
-    totalDebit += fee;
-
-    metadata = {
-      ...(metadata || {}),
-      fee,
-      percentFee,
-      flatFee
-    };
-  }
-
-  await acquireIdempotency(idempotency_key);
-
-  const conn = await pool.getConnection();
+  const { conn, isExternal } = resolveConn(externalConn);
+  const connection = conn || await pool.getConnection();
 
   try {
-    await conn.beginTransaction();
+    if (!isExternal) await connection.beginTransaction();
 
-    const [[wallet]] = await conn.query(
-      `SELECT balance, locked_balance, status
-       FROM wallets
-       WHERE id = ?
-       FOR UPDATE`,
-      [walletId]
+    const wallet = await getWalletForUpdate(connection, walletId);
+
+    const available = wallet.balance - wallet.locked_balance;
+    if (available < amount) throw walletError('INSUFFICIENT_BALANCE');
+
+    const [lockRes] = await connection.query(
+      `INSERT INTO wallet_locks (
+        wallet_id, user_id, amount,
+        reference_type, reference_id, status
+      ) VALUES (?, ?, ?, ?, ?, 'active')`,
+      [walletId, userId, amount, reference_type, reference_id]
     );
 
-    if (!wallet) throw walletError('WALLET_NOT_FOUND');
-    if (wallet.status !== 'active') throw walletError('WALLET_FROZEN');
+    const newLocked = wallet.locked_balance + amount;
 
-    const available =
-      Number(wallet.balance) - Number(wallet.locked_balance);
-
-    if (available < totalDebit) {
-      throw walletError('INSUFFICIENT_BALANCE');
-    }
-
-    const before = Number(wallet.balance);
-    const after = before - totalDebit;
-
-    const [tx] = await conn.query(
+    await connection.query(
       `INSERT INTO wallet_transactions (
-        wallet_id,
-        user_id,
-        type,
-        amount,
-        balance_before,
-        balance_after,
-        source_type,
-        source_id,
-        idempotency_key,
-        metadata
-      ) VALUES (?, ?, 'debit', ?, ?, ?, ?, ?, ?, ?)`,
+        wallet_id, user_id, type, amount,
+        balance_before, balance_after,
+        locked_before, locked_after,
+        source_type, source_id,
+        idempotency_key, lock_id
+      ) VALUES (?, ?, 'lock', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         walletId,
         userId,
-        totalDebit,
-        before,
-        after,
-        source_type,
-        source_id || null,
-        idempotency_key || null,
-        metadata ? JSON.stringify(metadata) : null
+        amount,
+        wallet.balance,
+        wallet.balance,
+        wallet.locked_balance,
+        newLocked,
+        reference_type,
+        reference_id,
+        idempotency_key,
+        lockRes.insertId
       ]
     );
 
-    await conn.query(
-      `UPDATE wallets SET balance = ? WHERE id = ?`,
-      [after, walletId]
-    );
-
-    await conn.commit();
-
-/* =========================
-   USER NOTIFICATION
-========================= */
-await NotificationService.createNotification({
-  userId,
-  type: source_type,
-  title:
-    source_type === 'withdrawal'
-      ? 'Withdrawal update'
-      : 'Wallet debit',
-  message:
-    source_type === 'withdrawal'
-      ? `₦${amount} withdrawal processed`
-      : `₦${amount} debited from your wallet`,
-  reference_type: 'wallet_transaction',
-  reference_id: tx.insertId
-});
-
-return tx.insertId;
-
-  } catch (e) {
-    await conn.rollback();
-    await releaseIdempotency(idempotency_key);
-    throw e;
-  } finally {
-    conn.release();
-  }
-};
-
-/* =========================
-   LOCK FUNDS (NO LEDGER)
-========================= */
-
-exports.lockFunds = async ({ walletId, amount }) => {
-  if (!amount || amount <= 0) {
-    throw walletError('INVALID_AMOUNT');
-  }
-
-  const conn = await pool.getConnection();
-
-  try {
-    await conn.beginTransaction();
-
-    const [[wallet]] = await conn.query(
-      `SELECT balance, locked_balance, status
-       FROM wallets
-       WHERE id = ?
-       FOR UPDATE`,
-      [walletId]
-    );
-
-    if (!wallet) throw walletError('WALLET_NOT_FOUND');
-    if (wallet.status !== 'active') throw walletError('WALLET_FROZEN');
-
-    const available =
-      Number(wallet.balance) - Number(wallet.locked_balance);
-
-    if (available < amount) {
-      throw walletError('INSUFFICIENT_BALANCE');
-    }
-
-    await conn.query(
-      `UPDATE wallets
-       SET locked_balance = locked_balance + ?
-       WHERE id = ?`,
-      [amount, walletId]
-    );
-
-    await conn.commit();
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-};
-
-/* =========================
-   UNLOCK FUNDS (NO LEDGER)
-========================= */
-
-exports.unlockFunds = async ({ walletId, amount }) => {
-  if (!amount || amount <= 0) {
-    throw walletError('INVALID_AMOUNT');
-  }
-
-  const conn = await pool.getConnection();
-
-  try {
-    await conn.beginTransaction();
-
-    const [[wallet]] = await conn.query(
-      `SELECT locked_balance
-       FROM wallets
-       WHERE id = ?
-       FOR UPDATE`,
-      [walletId]
-    );
-
-    if (!wallet) throw walletError('WALLET_NOT_FOUND');
-
-    const currentLocked = Number(wallet.locked_balance);
-
-    // ✅ SAFE CALCULATION (NO NEGATIVE EVER)
-    const newLocked = Math.max(currentLocked - Number(amount), 0);
-
-    await conn.query(
-      `UPDATE wallets
-       SET locked_balance = ?
-       WHERE id = ?`,
+    await connection.query(
+      `UPDATE wallets SET locked_balance = ? WHERE id = ?`,
       [newLocked, walletId]
     );
 
-    await conn.commit();
+    if (!isExternal) await connection.commit();
+
+    return lockRes.insertId;
+
   } catch (e) {
-    await conn.rollback();
+    if (!isExternal) await connection.rollback();
+
+    if (e.code === 'ER_DUP_ENTRY') {
+      throw walletError('DUPLICATE_TRANSACTION');
+    }
+
     throw e;
+
   } finally {
-    conn.release();
+    if (!isExternal) connection.release();
+  }
+};
+
+/* =========================
+   UNLOCK (RELEASE)
+========================= */
+exports.unlock = async ({
+  walletId,
+  lockId,
+  idempotency_key,
+  conn: externalConn
+}) => {
+
+  if (!idempotency_key) throw walletError('IDEMPOTENCY_REQUIRED');
+
+  const { conn, isExternal } = resolveConn(externalConn);
+  const connection = conn || await pool.getConnection();
+
+  try {
+    if (!isExternal) await connection.beginTransaction();
+
+    const wallet = await getWalletForUpdate(connection, walletId);
+
+    const [[lock]] = await connection.query(
+      `SELECT * FROM wallet_locks
+       WHERE id = ? AND status = 'active'
+       FOR UPDATE`,
+      [lockId]
+    );
+
+    if (!lock) throw walletError('LOCK_NOT_FOUND');
+
+    const newLocked = wallet.locked_balance - lock.amount;
+    if (newLocked < 0) throw walletError('LOCK_CORRUPTION_DETECTED');
+
+    await connection.query(
+      `UPDATE wallet_locks SET status = 'released' WHERE id = ?`,
+      [lockId]
+    );
+
+    await connection.query(
+      `INSERT INTO wallet_transactions (
+        wallet_id, user_id, type, amount,
+        balance_before, balance_after,
+        locked_before, locked_after,
+        source_type, source_id,
+        idempotency_key, lock_id
+      ) VALUES (?, ?, 'unlock', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        walletId,
+        wallet.user_id,
+        lock.amount,
+        wallet.balance,
+        wallet.balance,
+        wallet.locked_balance,
+        newLocked,
+        lock.reference_type,
+        lock.reference_id,
+        idempotency_key,
+        lock.id
+      ]
+    );
+
+    await connection.query(
+      `UPDATE wallets SET locked_balance = ? WHERE id = ?`,
+      [newLocked, walletId]
+    );
+
+    if (!isExternal) await connection.commit();
+
+  } catch (e) {
+    if (!isExternal) await connection.rollback();
+
+    if (e.code === 'ER_DUP_ENTRY') {
+      throw walletError('DUPLICATE_TRANSACTION');
+    }
+
+    throw e;
+
+  } finally {
+    if (!isExternal) connection.release();
+  }
+};
+
+/* =========================
+   CONSUME LOCKED
+========================= */
+exports.consumeLocked = async ({
+  walletId,
+  lockId,
+  idempotency_key,
+  conn: externalConn
+}) => {
+
+  if (!idempotency_key) throw walletError('IDEMPOTENCY_REQUIRED');
+
+  const { conn, isExternal } = resolveConn(externalConn);
+  const connection = conn || await pool.getConnection();
+
+  try {
+    if (!isExternal) await connection.beginTransaction();
+
+    const wallet = await getWalletForUpdate(connection, walletId);
+
+    const [[lock]] = await connection.query(
+      `SELECT * FROM wallet_locks
+       WHERE id = ? AND status = 'active'
+       FOR UPDATE`,
+      [lockId]
+    );
+
+    if (!lock) throw walletError('LOCK_NOT_FOUND');
+
+    const newBalance = wallet.balance - lock.amount;
+    const newLocked = wallet.locked_balance - lock.amount;
+
+    if (newBalance < 0 || newLocked < 0) {
+      throw walletError('CORRUPTION_DETECTED');
+    }
+
+    await connection.query(
+      `UPDATE wallet_locks SET status = 'consumed' WHERE id = ?`,
+      [lockId]
+    );
+
+    await connection.query(
+      `INSERT INTO wallet_transactions (
+        wallet_id, user_id, type, amount,
+        balance_before, balance_after,
+        locked_before, locked_after,
+        source_type, source_id,
+        idempotency_key, lock_id
+      ) VALUES (?, ?, 'consume_locked', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        walletId,
+        wallet.user_id,
+        lock.amount,
+        wallet.balance,
+        newBalance,
+        wallet.locked_balance,
+        newLocked,
+        lock.reference_type,
+        lock.reference_id,
+        idempotency_key,
+        lock.id
+      ]
+    );
+
+    await connection.query(
+      `UPDATE wallets
+       SET balance = ?, locked_balance = ?
+       WHERE id = ?`,
+      [newBalance, newLocked, walletId]
+    );
+
+    if (!isExternal) await connection.commit();
+
+  } catch (e) {
+    if (!isExternal) await connection.rollback();
+
+    if (e.code === 'ER_DUP_ENTRY') {
+      throw walletError('DUPLICATE_TRANSACTION');
+    }
+
+    throw e;
+
+  } finally {
+    if (!isExternal) connection.release();
   }
 };

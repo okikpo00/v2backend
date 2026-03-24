@@ -23,22 +23,23 @@ exports.place = async ({
 
   validateEntryPayload({ stake, entries });
 
-  const slipUuid = uuidv4(); // ✅ FIXED (local, safe)
-
-  // Prevent duplicate questions
-  const unique = new Set();
-  for (const e of entries) {
-    if (unique.has(e.question_id)) {
-      throw entryError('DUPLICATE_QUESTION_IN_SLIP');
-    }
-    unique.add(e.question_id);
-  }
-
+  const slipUuid = uuidv4();
   const conn = await pool.getConnection();
   const affectedQuestionIds = new Set();
 
   try {
     await conn.beginTransaction();
+
+    /* =============================
+       PREVENT DUPLICATE QUESTIONS
+    ============================= */
+    const unique = new Set();
+    for (const e of entries) {
+      if (unique.has(e.question_id)) {
+        throw entryError('DUPLICATE_QUESTION_IN_SLIP');
+      }
+      unique.add(e.question_id);
+    }
 
     /* =============================
        SYSTEM SETTINGS
@@ -47,26 +48,19 @@ exports.place = async ({
       minStake,
       maxStake,
       maxAccumulatedOdds,
-      maxPayout,
-      maxQuestionExposure
+      maxPayout
     ] = await Promise.all([
       System.getDecimal('MIN_STAKE_AMOUNT'),
       System.getDecimal('MAX_STAKE_AMOUNT'),
       System.getDecimal('MAX_ACCUMULATED_ODDS'),
-      System.getDecimal('MAX_PAYOUT'),
-      System.getDecimal('MAX_QUESTION_EXPOSURE')
+      System.getDecimal('MAX_PAYOUT')
     ]);
 
-    if (Number(stake) < Number(minStake)) {
-      throw entryError('STAKE_TOO_SMALL');
-    }
-
-    if (Number(stake) > Number(maxStake)) {
-      throw entryError('STAKE_TOO_LARGE');
-    }
+    if (stake < Number(minStake)) throw entryError('STAKE_TOO_SMALL');
+    if (stake > Number(maxStake)) throw entryError('STAKE_TOO_LARGE');
 
     /* =============================
-       ENSURE WALLET EXISTS
+       ENSURE WALLET
     ============================= */
     await conn.query(
       `
@@ -79,50 +73,26 @@ exports.place = async ({
       [userId, userId]
     );
 
-    /* =============================
-       GET WALLET (NO LOCK)
-    ============================= */
     const [[wallet]] = await conn.query(
       `
       SELECT id
       FROM wallets
       WHERE user_id = ?
-        AND currency = 'NGN'
-        AND status = 'active'
+      AND currency = 'NGN'
+      AND status = 'active'
       LIMIT 1
+      FOR UPDATE
       `,
       [userId]
     );
 
     if (!wallet) throw entryError('WALLET_NOT_FOUND');
 
-    /* =============================
-       DEBIT WALLET (SINGLE SOURCE OF TRUTH)
-    ============================= */
-    await WalletService.debitWallet({
-      walletId: wallet.id,
-      userId,
-      amount: Number(stake),
-      source_type: 'stake',
-      source_id: slipUuid,
-      idempotency_key: `stake:${slipUuid}`
-    });
+    const walletId = wallet.id;
 
     /* =============================
-       USERNAME
+       CREATE SLIP FIRST (IMPORTANT)
     ============================= */
-    const [[userRow]] = await conn.query(
-      `SELECT username FROM users WHERE id = ? LIMIT 1`,
-      [userId]
-    );
-
-    const username = userRow?.username || 'User';
-
-    /* =============================
-       CREATE SLIP
-    ============================= */
-    let totalOdds = 1;
-
     const [slipRes] = await conn.query(
       `
       INSERT INTO curated_entry_slips (
@@ -141,7 +111,7 @@ exports.place = async ({
       [
         slipUuid,
         userId,
-        wallet.id,
+        walletId,
         Number(stake),
         entries.length,
         ip || null,
@@ -152,8 +122,32 @@ exports.place = async ({
     const slipId = slipRes.insertId;
 
     /* =============================
+       LOCK FUNDS (AFTER SLIP)
+    ============================= */
+    let lockId;
+
+    try {
+      lockId = await WalletService.lock({
+        walletId,
+        userId,
+        amount: Number(stake),
+        reference_type: 'entry',
+        reference_id: slipUuid,
+        idempotency_key: `entry_lock:${slipUuid}`,
+        conn
+      });
+    } catch (e) {
+      if (e.code === 'DUPLICATE_TRANSACTION') {
+        throw entryError('DUPLICATE_ENTRY');
+      }
+      throw e;
+    }
+
+    /* =============================
        PROCESS ENTRIES
     ============================= */
+    let totalOdds = 1;
+
     for (const e of entries) {
 
       const [[question]] = await conn.query(
@@ -161,7 +155,7 @@ exports.place = async ({
         SELECT id, yes_odds, no_odds
         FROM curated_questions
         WHERE id = ?
-          AND status = 'published'
+        AND status = 'published'
         FOR UPDATE
         `,
         [e.question_id]
@@ -169,16 +163,16 @@ exports.place = async ({
 
       if (!question) throw entryError('QUESTION_NOT_AVAILABLE');
 
-      const entryOdds =
+      const odds =
         e.side === 'yes'
           ? Number(question.yes_odds)
           : Number(question.no_odds);
 
-      if (!entryOdds || entryOdds <= 1) {
+      if (!odds || odds <= 1) {
         throw entryError('INVALID_ODDS');
       }
 
-      totalOdds *= entryOdds;
+      totalOdds *= odds;
 
       if (totalOdds > Number(maxAccumulatedOdds)) {
         throw entryError('MAX_ACCUMULATED_ODDS_EXCEEDED');
@@ -188,17 +182,16 @@ exports.place = async ({
         `
         INSERT INTO curated_question_entries (
           slip_id, question_id, user_id, wallet_id,
-          side, stake, odds, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+          side, odds, status
+        ) VALUES (?, ?, ?, ?, ?, ?, 'open')
         `,
         [
           slipId,
           question.id,
           userId,
-          wallet.id,
+          walletId,
           e.side,
-          Number(stake),
-          entryOdds
+          odds
         ]
       );
 
@@ -230,13 +223,12 @@ exports.place = async ({
     await conn.commit();
 
     /* =============================
-       POST ACTIONS (OUTSIDE TX)
+       POST ACTIONS
     ============================= */
     const ActivityLogger = require('./homepage.activity.logger');
 
     await ActivityLogger.logPlacedCall({
       userId,
-      username,
       amount: stake
     });
 

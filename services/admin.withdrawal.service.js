@@ -10,7 +10,7 @@ function adminWithdrawalError(code, message) {
 }
 
 /* =========================================================
-   LIST PENDING WITHDRAWALS (ADMIN)
+   LIST PENDING WITHDRAWALS
 ========================================================= */
 exports.listPending = async () => {
   const [rows] = await pool.query(`
@@ -41,7 +41,7 @@ exports.listPending = async () => {
 };
 
 /* =========================================================
-   APPROVE WITHDRAWAL (FIXED - PRODUCTION SAFE)
+   APPROVE WITHDRAWAL (PRODUCTION SAFE)
 ========================================================= */
 exports.approve = async ({
   adminId,
@@ -49,11 +49,15 @@ exports.approve = async ({
   ip,
   user_agent
 }) => {
+
   const conn = await pool.getConnection();
 
   try {
     await conn.beginTransaction();
 
+    /* =========================
+       LOCK WITHDRAWAL
+    ========================= */
     const [[withdrawal]] = await conn.query(
       `SELECT *
        FROM withdrawal_requests
@@ -67,33 +71,37 @@ exports.approve = async ({
     if (!withdrawal) {
       throw adminWithdrawalError('INVALID_WITHDRAWAL');
     }
-  /* =========================
-       STEP 2: UNLOCK FUNDS (CRITICAL FIX)
-    ========================= */
-    await WalletService.unlockFunds({
-      walletId: withdrawal.wallet_id,
-      amount: withdrawal.total_debit
-    });
-    
-    /* =========================
-       STEP 1: DEBIT WALLET
-    ========================= */
-    await WalletService.debitWallet({
-      walletId: withdrawal.wallet_id,
-      userId: withdrawal.user_id,
-      amount: withdrawal.total_debit,
-      source_type: 'withdrawal',
-      source_id: withdrawal.uuid,
-      idempotency_key: `withdrawal:${withdrawal.uuid}`,
-      metadata: {
-        admin_id: adminId
-      }
-    });
-
-  
 
     /* =========================
-       STEP 3: UPDATE STATUS
+       FETCH LOCK (SOURCE OF TRUTH)
+    ========================= */
+    const [[lock]] = await conn.query(
+      `SELECT id
+       FROM wallet_locks
+       WHERE reference_type = 'withdrawal'
+         AND reference_id = ?
+         AND status = 'active'
+       LIMIT 1
+       FOR UPDATE`,
+      [withdrawal_uuid]
+    );
+
+    if (!lock) {
+      throw adminWithdrawalError('LOCK_NOT_FOUND');
+    }
+
+    /* =========================
+       CONSUME LOCK (FINAL DEBIT)
+    ========================= */
+    await WalletService.consumeLocked({
+      walletId: withdrawal.wallet_id,
+      lockId: lock.id,
+      idempotency_key: `withdrawal_consume:${withdrawal_uuid}`,
+      conn
+    });
+
+    /* =========================
+       UPDATE WITHDRAWAL
     ========================= */
     await conn.query(
       `UPDATE withdrawal_requests
@@ -105,7 +113,7 @@ exports.approve = async ({
     );
 
     /* =========================
-       STEP 4: AUDIT LOG
+       AUDIT LOG
     ========================= */
     await conn.query(
       `INSERT INTO admin_audit_logs
@@ -116,16 +124,10 @@ exports.approve = async ({
 
     await conn.commit();
 
-    console.log('[WITHDRAW_APPROVED_SUCCESS]', {
-      withdrawal_uuid,
-      amount: withdrawal.total_debit
-    });
-
     return { success: true };
 
   } catch (e) {
     await conn.rollback();
-    console.error('[WITHDRAW_APPROVE_ERROR]', e);
     throw e;
   } finally {
     conn.release();
@@ -133,7 +135,7 @@ exports.approve = async ({
 };
 
 /* =========================================================
-   REJECT WITHDRAWAL
+   REJECT WITHDRAWAL (PRODUCTION SAFE)
 ========================================================= */
 exports.reject = async ({
   adminId,
@@ -143,11 +145,15 @@ exports.reject = async ({
   ip,
   user_agent
 }) => {
+
   const conn = await pool.getConnection();
 
   try {
     await conn.beginTransaction();
 
+    /* =========================
+       LOCK WITHDRAWAL
+    ========================= */
     const [[withdrawal]] = await conn.query(
       `SELECT *
        FROM withdrawal_requests
@@ -162,12 +168,37 @@ exports.reject = async ({
       throw adminWithdrawalError('INVALID_WITHDRAWAL');
     }
 
-    // Unlock funds
-    await WalletService.unlockFunds({
+    /* =========================
+       FETCH LOCK
+    ========================= */
+    const [[lock]] = await conn.query(
+      `SELECT id
+       FROM wallet_locks
+       WHERE reference_type = 'withdrawal'
+         AND reference_id = ?
+         AND status = 'active'
+       LIMIT 1
+       FOR UPDATE`,
+      [withdrawal_uuid]
+    );
+
+    if (!lock) {
+      throw adminWithdrawalError('LOCK_NOT_FOUND');
+    }
+
+    /* =========================
+       RELEASE LOCK (REFUND USER)
+    ========================= */
+    await WalletService.unlock({
       walletId: withdrawal.wallet_id,
-      amount: withdrawal.total_debit
+      lockId: lock.id,
+      idempotency_key: `withdrawal_release:${withdrawal_uuid}`,
+      conn
     });
 
+    /* =========================
+       UPDATE WITHDRAWAL
+    ========================= */
     await conn.query(
       `UPDATE withdrawal_requests
        SET status = 'rejected',
@@ -179,6 +210,9 @@ exports.reject = async ({
       [adminId, reason, note || null, withdrawal.id]
     );
 
+    /* =========================
+       AUDIT LOG
+    ========================= */
     await conn.query(
       `INSERT INTO admin_audit_logs
        (admin_id, actor_role, action, target_type, target_id, metadata, ip_address, user_agent)
@@ -187,7 +221,9 @@ exports.reject = async ({
     );
 
     await conn.commit();
+
     return { success: true };
+
   } catch (e) {
     await conn.rollback();
     throw e;

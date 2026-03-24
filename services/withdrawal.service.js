@@ -13,10 +13,11 @@ function withdrawalError(code, message) {
   return err;
 }
 
+/* =========================
+   OTP HELPERS
+========================= */
 function generateOTP() {
-  return String(
-    Math.floor(100000 + Math.random() * 900000)
-  );
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
 function hashOTP(otp) {
@@ -24,11 +25,10 @@ function hashOTP(otp) {
 }
 
 /* =========================================================
-   REQUEST WITHDRAWAL
+   REQUEST WITHDRAWAL (PRODUCTION SAFE)
 ========================================================= */
 exports.requestWithdrawal = async ({
   userId,
-
   amount,
   bank_name,
   account_number,
@@ -36,7 +36,6 @@ exports.requestWithdrawal = async ({
   ip,
   user_agent
 }) => {
-  console.log('[WITHDRAW_REQUEST] start', { userId, amount });
 
   if (!amount || amount <= 0) {
     throw withdrawalError('INVALID_AMOUNT');
@@ -48,10 +47,17 @@ exports.requestWithdrawal = async ({
 
   await System.assertEnabled('WITHDRAWALS_ENABLED');
 
-  const min = await System.getDecimal('MIN_WITHDRAW_AMOUNT');
-  const max = await System.getDecimal('MAX_WITHDRAW_AMOUNT');
-  const percentFee = await System.getDecimal('WITHDRAWAL_FEE_PERCENT');
-  const flatFee = await System.getDecimal('WITHDRAWAL_FLAT_FEE');
+  const [
+    min,
+    max,
+    percentFee,
+    flatFee
+  ] = await Promise.all([
+    System.getDecimal('MIN_WITHDRAW_AMOUNT'),
+    System.getDecimal('MAX_WITHDRAW_AMOUNT'),
+    System.getDecimal('WITHDRAWAL_FEE_PERCENT'),
+    System.getDecimal('WITHDRAWAL_FLAT_FEE')
+  ]);
 
   if (amount < min) throw withdrawalError('BELOW_MIN_WITHDRAW');
   if (amount > max) throw withdrawalError('ABOVE_MAX_WITHDRAW');
@@ -63,54 +69,27 @@ exports.requestWithdrawal = async ({
 
   try {
     await conn.beginTransaction();
-const [[wallet]] = await conn.query(
-  `SELECT id
-   FROM wallets
-   WHERE user_id = ?
-     AND status = 'active'
-   LIMIT 1
-   FOR UPDATE`,
-  [userId]
-);
 
-if (!wallet) {
-  throw withdrawalError('WALLET_NOT_FOUND');
-}
+    /* =========================
+       GET WALLET (LOCKED)
+    ========================= */
+    const [[wallet]] = await conn.query(
+      `SELECT id
+       FROM wallets
+       WHERE user_id = ?
+         AND status = 'active'
+       LIMIT 1
+       FOR UPDATE`,
+      [userId]
+    );
 
-const walletId = wallet.id;
-    // Lock funds first
+    if (!wallet) throw withdrawalError('WALLET_NOT_FOUND');
 
-const [[walletRow]] = await conn.query(
-  `SELECT balance, locked_balance, status
-   FROM wallets
-   WHERE id = ?
-   FOR UPDATE`,
-  [walletId]
-);
+    const walletId = wallet.id;
 
-if (!walletRow) {
-  throw withdrawalError('WALLET_NOT_FOUND');
-}
-
-if (walletRow.status !== 'active') {
-  throw withdrawalError('WALLET_FROZEN');
-}
-
-const available =
-  Number(walletRow.balance) - Number(walletRow.locked_balance);
-
-if (available < totalDebit) {
-  throw withdrawalError('INSUFFICIENT_BALANCE');
-}
-
-await conn.query(
-  `UPDATE wallets
-   SET locked_balance = locked_balance + ?
-   WHERE id = ?`,
-  [totalDebit, walletId]
-);
-    
-
+    /* =========================
+       CREATE WITHDRAWAL FIRST
+    ========================= */
     const uuid = uuidv4();
 
     const [res] = await conn.query(
@@ -137,43 +116,62 @@ await conn.query(
 
     const withdrawalId = res.insertId;
 
+    /* =========================
+       LOCK FUNDS (SOURCE OF TRUTH)
+    ========================= */
+    try {
+      await WalletService.lock({
+        walletId,
+        userId,
+        amount: totalDebit,
+        reference_type: 'withdrawal',
+        reference_id: uuid,
+        idempotency_key: `withdrawal_lock:${uuid}`,
+        conn
+      });
+    } catch (e) {
+      if (e.code === 'DUPLICATE_TRANSACTION') {
+        throw withdrawalError('DUPLICATE_WITHDRAWAL');
+      }
+      throw e;
+    }
+
+    /* =========================
+       CREATE OTP
+    ========================= */
     const otp = generateOTP();
     const otpHash = hashOTP(otp);
 
     await conn.query(
       `INSERT INTO withdrawal_otps
-       (withdrawal_id, otp_hash, expires_at)
-       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))`,
+       (withdrawal_id, otp_hash, expires_at, attempts, resend_count)
+       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE), 0, 0)`,
       [withdrawalId, otpHash]
     );
 
     await conn.commit();
 
-    console.log('[WITHDRAW_REQUEST] created', { withdrawalId });
-
     return {
       withdrawal_uuid: uuid,
-      otp // SEND VIA EMAIL (not returned in prod)
+      otp // remove in prod response layer
     };
+
   } catch (e) {
     await conn.rollback();
-    console.error('[WITHDRAW_REQUEST_ERROR]', e);
     throw e;
   } finally {
     conn.release();
   }
 };
+
 /* =========================================================
-   VERIFY WITHDRAWAL OTP
+   VERIFY OTP
 ========================================================= */
 exports.verifyWithdrawalOTP = async ({
   userId,
   withdrawal_uuid,
-  otp,
-  ip,
-  user_agent
+  otp
 }) => {
-  console.log('[WITHDRAW_OTP_VERIFY] start', { userId, withdrawal_uuid });
 
   if (!withdrawal_uuid || !otp) {
     throw withdrawalError('INVALID_INPUT');
@@ -185,76 +183,54 @@ exports.verifyWithdrawalOTP = async ({
   try {
     await conn.beginTransaction();
 
-    /* -------------------------
-       FETCH WITHDRAWAL
-    ------------------------- */
     const [[withdrawal]] = await conn.query(
       `SELECT id, status
        FROM withdrawal_requests
-       WHERE uuid = ?
-         AND user_id = ?
+       WHERE uuid = ? AND user_id = ?
        LIMIT 1
        FOR UPDATE`,
       [withdrawal_uuid, userId]
     );
 
-    if (!withdrawal) {
-      throw withdrawalError('WITHDRAWAL_NOT_FOUND');
-    }
-
+    if (!withdrawal) throw withdrawalError('WITHDRAWAL_NOT_FOUND');
     if (withdrawal.status !== 'otp_pending') {
       throw withdrawalError('INVALID_WITHDRAWAL_STATE');
     }
 
-    /* -------------------------
-       FETCH OTP
-    ------------------------- */
     const [[otpRow]] = await conn.query(
       `SELECT id, expires_at, verified_at, attempts
        FROM withdrawal_otps
        WHERE withdrawal_id = ?
-         AND otp_hash = ?
-       LIMIT 1
        FOR UPDATE`,
-      [withdrawal.id, otpHash]
+      [withdrawal.id]
     );
 
-    if (!otpRow) {
-      await conn.query(
-        `UPDATE withdrawal_otps
-         SET attempts = attempts + 1
-         WHERE withdrawal_id = ?`,
-        [withdrawal.id]
-      );
+    if (!otpRow) throw withdrawalError('OTP_NOT_FOUND');
 
-      throw withdrawalError('INVALID_OTP');
-    }
-
-    if (otpRow.verified_at) {
-      throw withdrawalError('OTP_ALREADY_USED');
-    }
-
+    if (otpRow.verified_at) throw withdrawalError('OTP_ALREADY_USED');
+    if (otpRow.attempts >= 5) throw withdrawalError('OTP_ATTEMPTS_EXCEEDED');
     if (new Date(otpRow.expires_at) <= new Date()) {
       throw withdrawalError('OTP_EXPIRED');
     }
 
-    if (otpRow.attempts >= 5) {
-      throw withdrawalError('OTP_ATTEMPTS_EXCEEDED');
+    if (otpHash !== (await conn.query(
+      `SELECT otp_hash FROM withdrawal_otps WHERE id = ?`,
+      [otpRow.id]
+    ))[0][0].otp_hash) {
+      await conn.query(
+        `UPDATE withdrawal_otps
+         SET attempts = attempts + 1
+         WHERE id = ?`,
+        [otpRow.id]
+      );
+      throw withdrawalError('INVALID_OTP');
     }
 
-    /* -------------------------
-       MARK OTP VERIFIED
-    ------------------------- */
     await conn.query(
-      `UPDATE withdrawal_otps
-       SET verified_at = NOW()
-       WHERE id = ?`,
+      `UPDATE withdrawal_otps SET verified_at = NOW() WHERE id = ?`,
       [otpRow.id]
     );
 
-    /* -------------------------
-       UPDATE WITHDRAWAL STATE
-    ------------------------- */
     await conn.query(
       `UPDATE withdrawal_requests
        SET status = 'pending_admin'
@@ -264,93 +240,8 @@ exports.verifyWithdrawalOTP = async ({
 
     await conn.commit();
 
-    console.log('[WITHDRAW_OTP_VERIFY] success', { withdrawal_uuid });
     return { success: true };
-  } catch (e) {
-    await conn.rollback();
-    console.error('[WITHDRAW_OTP_VERIFY_ERROR]', e);
-    throw e;
-  } finally {
-    conn.release();
-  }
-};
-exports.resendWithdrawalOTP = async ({
-  userId,
-  withdrawal_uuid,
-  ip,
-  user_agent
-}) => {
-  const conn = await pool.getConnection();
 
-  try {
-    await conn.beginTransaction();
-
-    /* 1️⃣ Fetch withdrawal */
-    const [[withdrawal]] = await conn.query(
-      `SELECT id, status
-       FROM withdrawal_requests
-       WHERE uuid = ?
-         AND user_id = ?
-       LIMIT 1
-       FOR UPDATE`,
-      [withdrawal_uuid, userId]
-    );
-
-    if (!withdrawal) {
-      throw withdrawalError('WITHDRAWAL_NOT_FOUND');
-    }
-
-    if (withdrawal.status !== 'otp_pending') {
-      throw withdrawalError('INVALID_WITHDRAWAL_STATE');
-    }
-
-    /* 2️⃣ Fetch latest OTP */
-    const [[otpRow]] = await conn.query(
-      `SELECT id, resend_count, last_sent_at
-       FROM withdrawal_otps
-       WHERE withdrawal_id = ?
-       ORDER BY id DESC
-       LIMIT 1
-       FOR UPDATE`,
-      [withdrawal.id]
-    );
-
-    if (!otpRow) {
-      throw withdrawalError('OTP_NOT_FOUND');
-    }
-
-    /* 3️⃣ Enforce resend rules */
-    if (otpRow.resend_count >= 3) {
-      throw withdrawalError('OTP_RESEND_LIMIT_EXCEEDED');
-    }
-
-    if (
-      otpRow.last_sent_at &&
-      new Date(Date.now() - 60 * 1000) < new Date(otpRow.last_sent_at)
-    ) {
-      throw withdrawalError('OTP_RESEND_TOO_SOON');
-    }
-
-    /* 4️⃣ Generate new OTP */
-    const otp = generateOTP();
-    const otpHash = hashOTP(otp);
-
-    await conn.query(
-      `UPDATE withdrawal_otps
-       SET otp_hash = ?,
-           expires_at = DATE_ADD(NOW(), INTERVAL 10 MINUTE),
-           resend_count = resend_count + 1,
-           last_sent_at = NOW(),
-           attempts = 0
-       WHERE id = ?`,
-      [otpHash, otpRow.id]
-    );
-
-    await conn.commit();
-
-    return {
-      otp // dev only – controller will strip in prod
-    };
   } catch (e) {
     await conn.rollback();
     throw e;
@@ -358,44 +249,66 @@ exports.resendWithdrawalOTP = async ({
     conn.release();
   }
 };
-
 
 /* =========================================================
-   CANCEL WITHDRAWAL (USER)
+   CANCEL WITHDRAWAL
 ========================================================= */
 exports.cancelWithdrawal = async ({ userId, withdrawal_uuid }) => {
+
   const conn = await pool.getConnection();
 
   try {
     await conn.beginTransaction();
 
-    const [[row]] = await conn.query(
-      `SELECT id, wallet_id, total_debit, status
+    const [[withdrawal]] = await conn.query(
+      `SELECT id, wallet_id, status
        FROM withdrawal_requests
        WHERE uuid = ? AND user_id = ?
        FOR UPDATE`,
       [withdrawal_uuid, userId]
     );
 
-    if (!row) throw withdrawalError('WITHDRAWAL_NOT_FOUND');
+    if (!withdrawal) throw withdrawalError('WITHDRAWAL_NOT_FOUND');
 
-    if (!['otp_pending', 'pending_admin'].includes(row.status)) {
+    if (!['otp_pending', 'pending_admin'].includes(withdrawal.status)) {
       throw withdrawalError('CANNOT_CANCEL_WITHDRAWAL');
     }
+
+    /* =========================
+       FETCH LOCK
+    ========================= */
+    const [[lock]] = await conn.query(
+      `SELECT id
+       FROM wallet_locks
+       WHERE reference_type = 'withdrawal'
+         AND reference_id = ?
+         AND status = 'active'
+       LIMIT 1
+       FOR UPDATE`,
+      [withdrawal_uuid]
+    );
+
+    if (!lock) throw withdrawalError('LOCK_NOT_FOUND');
+
+    /* =========================
+       RELEASE LOCK
+    ========================= */
+    await WalletService.unlock({
+      walletId: withdrawal.wallet_id,
+      lockId: lock.id,
+      idempotency_key: `withdrawal_cancel:${withdrawal_uuid}`,
+      conn
+    });
 
     await conn.query(
       `UPDATE withdrawal_requests
        SET status = 'cancelled'
        WHERE id = ?`,
-      [row.id]
+      [withdrawal.id]
     );
 
-    await WalletService.unlockFunds({
-      walletId: row.wallet_id,
-      amount: row.total_debit
-    });
-
     await conn.commit();
+
   } catch (e) {
     await conn.rollback();
     throw e;

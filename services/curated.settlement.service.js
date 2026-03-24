@@ -1,6 +1,8 @@
 'use strict';
 
 const pool = require('../config/db');
+const WalletService = require('./wallet.service');
+
 const {
   ENTRY_STATUS,
   SLIP_STATUS,
@@ -18,40 +20,32 @@ exports.settleQuestion = async ({ questionId, outcome, isVoid }) => {
   const conn = await pool.getConnection();
 
   try {
-
     await conn.beginTransaction();
 
     /* =====================================================
        1. LOCK QUESTION
     ===================================================== */
     const [[question]] = await conn.query(
-      `
-      SELECT id, status, title
-      FROM curated_questions
-      WHERE id = ?
-      FOR UPDATE
-      `,
+      `SELECT id, status, title
+       FROM curated_questions
+       WHERE id = ?
+       FOR UPDATE`,
       [questionId]
     );
 
     if (!question) throw settlementError('QUESTION_NOT_FOUND');
 
-    if (!['published','locked'].includes(question.status)) {
+    if (![QUESTION_STATUS.PUBLISHED, QUESTION_STATUS.LOCKED].includes(question.status)) {
       throw settlementError('QUESTION_NOT_SETTLABLE');
     }
 
     /* =====================================================
-       2. UPDATE QUESTION STATE
+       2. MARK QUESTION SETTLED
     ===================================================== */
     await conn.query(
-      `
-      UPDATE curated_questions
-      SET
-        status = ?,
-        outcome = ?,
-        settled_at = NOW()
-      WHERE id = ?
-      `,
+      `UPDATE curated_questions
+       SET status = ?, outcome = ?, settled_at = NOW()
+       WHERE id = ?`,
       [
         isVoid ? QUESTION_STATUS.VOIDED : QUESTION_STATUS.SETTLED,
         isVoid ? null : outcome,
@@ -63,19 +57,16 @@ exports.settleQuestion = async ({ questionId, outcome, isVoid }) => {
        3. LOCK ENTRIES
     ===================================================== */
     const [entries] = await conn.query(
-      `
-      SELECT *
-      FROM curated_question_entries
-      WHERE question_id = ?
-        AND status = 'open'
-      ORDER BY id ASC
-      FOR UPDATE
-      `,
+      `SELECT *
+       FROM curated_question_entries
+       WHERE question_id = ?
+         AND status = 'open'
+       FOR UPDATE`,
       [questionId]
     );
 
     /* =====================================================
-       4. SETTLE ENTRIES
+       4. UPDATE ENTRY RESULTS
     ===================================================== */
     for (const e of entries) {
 
@@ -83,10 +74,7 @@ exports.settleQuestion = async ({ questionId, outcome, isVoid }) => {
       let payout = 0;
 
       if (isVoid) {
-
         status = ENTRY_STATUS.VOIDED;
-        payout = 0;
-
       } else {
 
         const won =
@@ -99,219 +87,185 @@ exports.settleQuestion = async ({ questionId, outcome, isVoid }) => {
         } else {
           status = ENTRY_STATUS.LOST;
         }
-
       }
 
       await conn.query(
-        `
-        UPDATE curated_question_entries
-        SET status = ?, payout = ?
-        WHERE id = ?
-        `,
+        `UPDATE curated_question_entries
+         SET status = ?, payout = ?
+         WHERE id = ?`,
         [status, payout, e.id]
       );
     }
 
     /* =====================================================
-       5. FIND AFFECTED SLIPS
+       5. GET AFFECTED SLIPS
     ===================================================== */
     const [slips] = await conn.query(
-      `
-      SELECT DISTINCT slip_id
-      FROM curated_question_entries
-      WHERE question_id = ?
-      `,
+      `SELECT DISTINCT slip_id
+       FROM curated_question_entries
+       WHERE question_id = ?`,
       [questionId]
     );
 
     /* =====================================================
-       6. PROCESS SLIPS
+       6. PROCESS EACH SLIP
     ===================================================== */
     for (const s of slips) {
 
       const [[slip]] = await conn.query(
-        `
-        SELECT *
-        FROM curated_entry_slips
-        WHERE id = ?
-        FOR UPDATE
-        `,
+        `SELECT *
+         FROM curated_entry_slips
+         WHERE id = ?
+         FOR UPDATE`,
         [s.slip_id]
       );
 
+      if (!slip) continue;
+
+      /* 🔒 Prevent double settlement */
+      if (slip.status === SLIP_STATUS.SETTLED) {
+        continue;
+      }
+
       const [slipEntries] = await conn.query(
-        `
-        SELECT status, odds
-        FROM curated_question_entries
-        WHERE slip_id = ?
-        `,
-        [s.slip_id]
+        `SELECT status, odds
+         FROM curated_question_entries
+         WHERE slip_id = ?`,
+        [slip.id]
       );
 
       const hasLost = slipEntries.some(e => e.status === ENTRY_STATUS.LOST);
       const hasOpen = slipEntries.some(e => e.status === ENTRY_STATUS.OPEN);
 
-      /* -------------------------
-         LOST RULE
-      ------------------------- */
+      /* =========================
+         FETCH LOCK
+      ========================= */
+      const [[lock]] = await conn.query(
+        `SELECT id
+         FROM wallet_locks
+         WHERE reference_type = 'entry'
+           AND reference_id = ?
+           AND status = 'active'
+         LIMIT 1
+         FOR UPDATE`,
+        [slip.uuid]
+      );
+
+      if (!lock) {
+        throw settlementError('LOCK_NOT_FOUND_FOR_SLIP');
+      }
+
+      /* =========================
+         LOST CASE
+      ========================= */
       if (hasLost) {
 
+        await WalletService.consumeLocked({
+          walletId: slip.wallet_id,
+          lockId: lock.id,
+          idempotency_key: `settle_lost:${slip.uuid}`,
+          conn
+        });
+
         await conn.query(
-          `
-          UPDATE curated_entry_slips
-          SET
-            status = 'settled',
-            result = 'lost',
-            potential_payout = 0,
-            total_odds = 0,
-            updated_at = NOW()
-          WHERE id = ?
-          `,
+          `UPDATE curated_entry_slips
+           SET status = 'settled',
+               result = 'lost',
+               potential_payout = 0,
+               total_odds = 0,
+               updated_at = NOW()
+           WHERE id = ?`,
           [slip.id]
         );
 
-        await settleWallet(conn, slip, 0, question.title);
+        continue;
+      }
+
+      /* =========================
+         STILL OPEN → SKIP
+      ========================= */
+      if (hasOpen) continue;
+
+      /* =========================
+         VOID CASE
+      ========================= */
+      if (isVoid) {
+
+        await WalletService.unlock({
+          walletId: slip.wallet_id,
+          lockId: lock.id,
+          idempotency_key: `settle_void:${slip.uuid}`,
+          conn
+        });
+
+        await conn.query(
+          `UPDATE curated_entry_slips
+           SET status = 'settled',
+               result = 'voided',
+               potential_payout = 0,
+               updated_at = NOW()
+           WHERE id = ?`,
+          [slip.id]
+        );
 
         continue;
       }
 
-      /* -------------------------
-         OPEN RULE
-      ------------------------- */
-      if (hasOpen) {
-        continue;
-      }
-
-      /* -------------------------
-         WON RULE
-      ------------------------- */
+      /* =========================
+         WON CASE
+      ========================= */
       let totalOdds = 1;
 
       for (const entry of slipEntries) {
-
         if (entry.status === ENTRY_STATUS.VOIDED) {
           totalOdds *= 1;
         } else {
           totalOdds *= Number(entry.odds);
         }
-
       }
 
       const payout = Number(slip.total_stake) * totalOdds;
 
+      /* 🔥 CONSUME LOCK FIRST */
+      await WalletService.consumeLocked({
+        walletId: slip.wallet_id,
+        lockId: lock.id,
+        idempotency_key: `settle_win_consume:${slip.uuid}`,
+        conn
+      });
+
+      /* 🔥 CREDIT WIN */
+      await WalletService.credit({
+        walletId: slip.wallet_id,
+        userId: slip.user_id,
+        amount: payout,
+        reference_type: 'curated_settlement',
+        reference_id: slip.uuid,
+        idempotency_key: `settle_win_credit:${slip.uuid}`,
+        metadata: {
+          slip_id: slip.id
+        },
+        conn
+      });
+
       await conn.query(
-        `
-        UPDATE curated_entry_slips
-        SET
-          status = 'settled',
-          result = 'won',
-          total_odds = ?,
-          potential_payout = ?,
-          updated_at = NOW()
-        WHERE id = ?
-        `,
+        `UPDATE curated_entry_slips
+         SET status = 'settled',
+             result = 'won',
+             total_odds = ?,
+             potential_payout = ?,
+             updated_at = NOW()
+         WHERE id = ?`,
         [totalOdds, payout, slip.id]
       );
-
-      await settleWallet(conn, slip, payout, question.title);
-
     }
 
     await conn.commit();
 
-  }
-  catch (err) {
-
+  } catch (err) {
     await conn.rollback();
     throw err;
-
-  }
-  finally {
-
+  } finally {
     conn.release();
-
   }
-
 };
-
-
-/* =========================================================
-   WALLET SETTLEMENT
-========================================================= */
-
-async function settleWallet(conn, slip, payout, questionTitle) {
-
-  const [[wallet]] = await conn.query(
-    `
-    SELECT balance, locked_balance
-    FROM wallets
-    WHERE id = ?
-    FOR UPDATE
-    `,
-    [slip.wallet_id]
-  );
-
-  await conn.query(
-    `
-    UPDATE wallets
-    SET locked_balance = locked_balance - ?
-    WHERE id = ?
-    `,
-    [slip.total_stake, slip.wallet_id]
-  );
-
-  if (payout <= 0) return;
-
-  const before = Number(wallet.balance);
-  const after  = before + payout;
-
-  await conn.query(
-    `
-    UPDATE wallets
-    SET balance = ?
-    WHERE id = ?
-    `,
-    [after, slip.wallet_id]
-  );
-
-  await conn.query(
-    `
-    INSERT INTO wallet_transactions
-    (
-      wallet_id,
-      user_id,
-      type,
-      amount,
-      balance_before,
-      balance_after,
-      source_type,
-      source_id
-    )
-    VALUES (?, ?, 'credit', ?, ?, ?, 'curated_settlement', ?)
-    `,
-    [
-      slip.wallet_id,
-      slip.user_id,
-      payout,
-      before,
-      after,
-      slip.uuid
-    ]
-  );
-
-  const [[user]] = await conn.query(
-    `SELECT username FROM users WHERE id = ? LIMIT 1`,
-    [slip.user_id]
-  );
-
-  const WinnerLogger =
-    require('./homepage.winner.logger');
-
-  await WinnerLogger.logWinner({
-    userId: slip.user_id,
-    username: user?.username || 'User',
-    amountWon: payout,
-    questionTitle
-  });
-
-}
