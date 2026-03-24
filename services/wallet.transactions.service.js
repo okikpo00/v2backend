@@ -1,32 +1,58 @@
 'use strict';
 
-/**
- * =========================================================
- * WALLET TRANSACTIONS READ SERVICE (ADMIN)
- * =========================================================
- * - Read-only ledger access
- * - Filtered, paginated, indexed
- * - Cursor-based pagination (no OFFSET)
- * - Safe for large tables
- * =========================================================
- */
-
 const pool = require('../config/db');
 
 /* =========================
    HELPERS
 ========================= */
 
-function buildCursorCondition(cursor) {
-  if (!cursor) return { sql: '', params: [] };
+function safeParseCursor(cursor) {
+  if (!cursor || typeof cursor !== 'string') {
+    return null;
+  }
 
-  const [createdAt, id] = cursor.split('|');
-  if (!createdAt || !id) return { sql: '', params: [] };
+  const parts = cursor.split('|');
+  if (parts.length !== 2) return null;
+
+  const [createdAt, id] = parts;
+
+  if (!createdAt || isNaN(Number(id))) {
+    return null;
+  }
 
   return {
-    sql: `AND (created_at < ? OR (created_at = ? AND id < ?))`,
-    params: [createdAt, createdAt, Number(id)]
+    createdAt,
+    id: Number(id)
   };
+}
+
+function buildCursorCondition(cursorParsed, hasWhere) {
+  if (!cursorParsed) {
+    return { sql: '', params: [] };
+  }
+
+  const prefix = hasWhere ? 'AND' : 'WHERE';
+
+  return {
+    sql: `
+      ${prefix} (created_at < ? OR (created_at = ? AND id < ?))
+    `,
+    params: [
+      cursorParsed.createdAt,
+      cursorParsed.createdAt,
+      cursorParsed.id
+    ]
+  };
+}
+
+function safeJSONParse(value) {
+  try {
+    if (value === null) return null;
+    if (typeof value === 'object') return value;
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }
 
 /* =========================
@@ -43,6 +69,12 @@ exports.fetchTransactions = async ({
   limit = 50,
   cursor
 }) => {
+
+  /* =========================
+     LIMIT GUARD
+  ========================= */
+  limit = Math.min(Number(limit) || 50, 100);
+
   const filters = [];
   const params = [];
 
@@ -76,11 +108,17 @@ exports.fetchTransactions = async ({
     params.push(date_to);
   }
 
-  const whereClause = filters.length
-    ? `WHERE ${filters.join(' AND ')}`
-    : '';
+  const whereClause =
+    filters.length > 0
+      ? `WHERE ${filters.join(' AND ')}`
+      : '';
 
-  const cursorCond = buildCursorCondition(cursor);
+  const cursorParsed = safeParseCursor(cursor);
+
+  const cursorCond = buildCursorCondition(
+    cursorParsed,
+    filters.length > 0
+  );
 
   const sql = `
     SELECT
@@ -104,7 +142,7 @@ exports.fetchTransactions = async ({
 
   const [rows] = await pool.query(
     sql,
-    [...params, ...cursorCond.params, Number(limit) + 1]
+    [...params, ...cursorCond.params, limit + 1]
   );
 
   let nextCursor = null;
@@ -112,20 +150,21 @@ exports.fetchTransactions = async ({
 
   if (rows.length > limit) {
     const last = rows[limit - 1];
-    nextCursor = `${last.created_at.toISOString()}|${last.id}`;
+
+    const createdAt =
+      last.created_at instanceof Date
+        ? last.created_at.toISOString()
+        : new Date(last.created_at).toISOString();
+
+    nextCursor = `${createdAt}|${last.id}`;
     results = rows.slice(0, limit);
   }
-return {
-  transactions: results.map((r) => ({
-    ...r,
-    metadata:
-      r.metadata === null
-        ? null
-        : typeof r.metadata === 'string'
-          ? JSON.parse(r.metadata)
-          : r.metadata
-  })),
-  nextCursor
-};
 
+  return {
+    transactions: results.map((r) => ({
+      ...r,
+      metadata: safeJSONParse(r.metadata)
+    })),
+    nextCursor
+  };
 };

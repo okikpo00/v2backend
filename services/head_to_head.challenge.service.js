@@ -12,10 +12,23 @@ function serviceError(message) {
   return err;
 }
 
+'use strict';
+
+const pool = require('../config/db');
+const System = require('./system.service');
+const WalletService = require('./wallet.service');
+const Util = require('../utils/head_to_head.util');
+const { v4: uuidv4 } = require('uuid');
+
+function serviceError(code) {
+  const err = new Error(code);
+  err.code = code;
+  return err;
+}
+
 /* =========================================================
    CREATE CHALLENGE
 ========================================================= */
-
 exports.createChallenge = async ({
   userId,
   questionId,
@@ -26,34 +39,29 @@ exports.createChallenge = async ({
   if (!['yes', 'no'].includes(side))
     throw serviceError('INVALID_SIDE');
 
-  if (!stake || stake <= 0)
+  if (!stake || isNaN(stake) || stake <= 0)
     throw serviceError('INVALID_STAKE');
-
-  /* ===============================
-     LOAD H2H STAKE LIMITS
-  =============================== */
-
-  const [minStake, maxStake] = await Promise.all([
-    System.getDecimal('H2H_MIN_STAKE'),
-    System.getDecimal('H2H_MAX_STAKE')
-  ]);
-
-  if (Number(stake) < Number(minStake))
-    throw serviceError('STAKE_BELOW_MINIMUM');
-
-  if (Number(stake) > Number(maxStake))
-    throw serviceError('STAKE_ABOVE_MAXIMUM');
 
   const conn = await pool.getConnection();
 
   try {
-
     await conn.beginTransaction();
 
-    /* ===============================
-       LOCK QUESTION
-    =============================== */
+    /* ---------- SETTINGS ---------- */
+    const [
+      minStake,
+      maxStake,
+      feePercent
+    ] = await Promise.all([
+      System.getDecimal('H2H_MIN_STAKE'),
+      System.getDecimal('H2H_MAX_STAKE'),
+      System.getDecimal('H2H_FEE_PERCENT')
+    ]);
 
+    if (stake < minStake) throw serviceError('STAKE_BELOW_MINIMUM');
+    if (stake > maxStake) throw serviceError('STAKE_ABOVE_MAXIMUM');
+
+    /* ---------- LOCK QUESTION ---------- */
     const [[question]] = await conn.query(
       `SELECT id, status
        FROM head_to_head_questions
@@ -62,95 +70,46 @@ exports.createChallenge = async ({
       [questionId]
     );
 
-    if (!question)
-      throw serviceError('QUESTION_NOT_FOUND');
-
+    if (!question) throw serviceError('QUESTION_NOT_FOUND');
     if (question.status !== 'published')
       throw serviceError('QUESTION_NOT_AVAILABLE');
 
-    /* ===============================
-       LOAD WALLET FROM USER
-    =============================== */
-
+    /* ---------- GET WALLET ---------- */
     const [[wallet]] = await conn.query(
-      `
-      SELECT id, balance, locked_balance
-      FROM wallets
-      WHERE user_id = ?
-      AND currency = 'NGN'
-      LIMIT 1
-      FOR UPDATE
-      `,
+      `SELECT id FROM wallets
+       WHERE user_id = ?
+       AND currency = 'NGN'
+       FOR UPDATE`,
       [userId]
     );
 
-    if (!wallet)
-      throw serviceError('INVALID_WALLET');
+    if (!wallet) throw serviceError('WALLET_NOT_FOUND');
 
-    const walletId = wallet.id;
-
-    const balance = Number(wallet.balance || 0);
-    const locked = Number(wallet.locked_balance || 0);
-    const available = balance - locked;
-
-    if (available < stake)
-      throw serviceError('INSUFFICIENT_BALANCE');
-
-    /* ===============================
-       LOCK FUNDS
-    =============================== */
-
-    await Escrow.lockFunds({
-      conn,
-      walletId,
-      amount: stake
+    /* ---------- LOCK FUNDS (LEDGERED) ---------- */
+    const lockId = await WalletService.lock({
+      walletId: wallet.id,
+      userId,
+      amount: stake,
+      reference_type: 'h2h_create',
+      reference_id: `${questionId}:${userId}`,
+      idempotency_key: `h2h_create:${questionId}:${userId}`,
+      conn
     });
 
-    /* ===============================
-       CREATE CHALLENGE
-    =============================== */
-
+    /* ---------- CREATE CHALLENGE ---------- */
     const uuid = uuidv4();
     const inviteCode = Util.generateInviteCode();
 
     await conn.query(
       `INSERT INTO head_to_head_challenges
        (uuid, question_id, creator_user_id, creator_wallet_id,
-        stake, creator_side, invite_code, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NOW())`,
-      [uuid, questionId, userId, walletId, stake, side, inviteCode]
+        stake, creator_side, invite_code, status, creator_lock_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NOW())`,
+      [uuid, questionId, userId, wallet.id, stake, side, inviteCode, lockId]
     );
-
-    /* ===============================
-       LOAD USERNAME
-    =============================== */
-
-    const [[userRow]] = await conn.query(
-      `SELECT username
-       FROM users
-       WHERE id = ?
-       LIMIT 1`,
-      [userId]
-    );
-
-    const creatorUsername = userRow?.username || null;
-
-    /* ===============================
-       LOAD PLATFORM FEE
-    =============================== */
-
-    const [[feeRow]] = await conn.query(
-      `SELECT value
-       FROM system_settings
-       WHERE \`key\` = 'H2H_FEE_PERCENT'
-       LIMIT 1`
-    );
-
-    const feePercent = Number(feeRow?.value || 0);
 
     const totalPot = stake * 2;
-    const platformFee = (totalPot * feePercent) / 100;
-    const potentialWin = totalPot - platformFee;
+    const fee = (totalPot * feePercent) / 100;
 
     await conn.commit();
 
@@ -159,31 +118,23 @@ exports.createChallenge = async ({
       invite_code: inviteCode,
       stake,
       total_pot: totalPot,
-      platform_fee: Number(platformFee.toFixed(2)),
-      potential_win: Number(potentialWin.toFixed(2)),
+      platform_fee: Number(fee.toFixed(2)),
+      potential_win: Number((totalPot - fee).toFixed(2)),
       status: 'pending',
-      creator_side: side,
-      creator_username: creatorUsername
+      creator_side: side
     };
 
   } catch (err) {
-
     await conn.rollback();
-
-    if (err.code) throw err;
-
-    console.error('[CREATE_CHALLENGE_SERVICE_ERROR]', err);
-
-    throw serviceError('CREATE_CHALLENGE_FAILED');
-
+    throw err.code ? err : serviceError('CREATE_CHALLENGE_FAILED');
   } finally {
-
     conn.release();
-
   }
-
 };
 
+/* =========================================================
+   ACCEPT CHALLENGE
+========================================================= */
 exports.acceptChallenge = async ({
   userId,
   inviteCode
@@ -192,151 +143,128 @@ exports.acceptChallenge = async ({
   const conn = await pool.getConnection();
 
   try {
-
     await conn.beginTransaction();
 
-    /* ===============================
-       LOAD CHALLENGE
-    =============================== */
+    const [[challenge]] = await conn.query(
+      `SELECT *
+       FROM head_to_head_challenges
+       WHERE invite_code = ?
+       FOR UPDATE`,
+      [inviteCode]
+    );
 
-    const [[challenge]] =
-      await conn.query(
-        `SELECT *
-         FROM head_to_head_challenges
-         WHERE invite_code = ?
-         FOR UPDATE`,
-        [inviteCode]
-      );
-
-    if (!challenge)
-      throw serviceError('CHALLENGE_NOT_FOUND');
-
+    if (!challenge) throw serviceError('CHALLENGE_NOT_FOUND');
     if (challenge.status !== 'pending')
       throw serviceError('CHALLENGE_NOT_AVAILABLE');
 
     if (challenge.creator_user_id === userId)
       throw serviceError('CANNOT_ACCEPT_OWN_CHALLENGE');
 
-    /* ===============================
-       LOCK QUESTION
-    =============================== */
-
-    const [[question]] =
-      await conn.query(
-        `SELECT status
-         FROM head_to_head_questions
-         WHERE id = ?
-         FOR UPDATE`,
-        [challenge.question_id]
-      );
-
-    if (!question || question.status !== 'published')
-      throw serviceError('CHALLENGE_EXPIRED');
-
-    /* ===============================
-       LOAD WALLET FROM USER
-    =============================== */
-
+    /* ---------- LOCK USER WALLET ---------- */
     const [[wallet]] = await conn.query(
-      `
-      SELECT id, balance, locked_balance
-      FROM wallets
-      WHERE user_id = ?
-      AND currency = 'NGN'
-      LIMIT 1
-      FOR UPDATE
-      `,
+      `SELECT id FROM wallets
+       WHERE user_id = ?
+       AND currency = 'NGN'
+       FOR UPDATE`,
       [userId]
     );
 
-    if (!wallet)
-      throw serviceError('INVALID_WALLET');
+    if (!wallet) throw serviceError('WALLET_NOT_FOUND');
 
-    const walletId = wallet.id;
-
-    const balance = Number(wallet.balance || 0);
-    const locked = Number(wallet.locked_balance || 0);
-    const available = balance - locked;
-
-    if (available < challenge.stake)
-      throw serviceError('INSUFFICIENT_BALANCE');
-
-    /* ===============================
-       LOCK FUNDS
-    =============================== */
-
-    await Escrow.lockFunds({
-      conn,
-      walletId,
-      amount: challenge.stake
+    const lockId = await WalletService.lock({
+      walletId: wallet.id,
+      userId,
+      amount: challenge.stake,
+      reference_type: 'h2h_accept',
+      reference_id: challenge.uuid,
+      idempotency_key: `h2h_accept:${challenge.uuid}:${userId}`,
+      conn
     });
-
-    /* ===============================
-       DETERMINE OPPONENT SIDE
-    =============================== */
 
     const opponentSide =
       challenge.creator_side === 'yes' ? 'no' : 'yes';
-
-    /* ===============================
-       UPDATE CHALLENGE
-    =============================== */
 
     await conn.query(
       `UPDATE head_to_head_challenges
        SET opponent_user_id = ?,
            opponent_wallet_id = ?,
            opponent_side = ?,
+           opponent_lock_id = ?,
            status = 'accepted',
            accepted_at = NOW()
        WHERE id = ?`,
-      [userId, walletId, opponentSide, challenge.id]
+      [userId, wallet.id, opponentSide, lockId, challenge.id]
     );
-
-    /* ===============================
-       PLATFORM FEE
-    =============================== */
-
-    const [[feeRow]] = await conn.query(
-      `SELECT value
-       FROM system_settings
-       WHERE \`key\` = 'H2H_FEE_PERCENT'
-       LIMIT 1`
-    );
-
-    const feePercent = Number(feeRow?.value || 0);
-    const stake = Number(challenge.stake);
-
-    const totalPot = stake * 2;
-    const platformFee = (totalPot * feePercent) / 100;
-    const potentialWin = totalPot - platformFee;
 
     await conn.commit();
 
     return {
       uuid: challenge.uuid,
-      stake,
-      total_pot: totalPot,
-      platform_fee: platformFee,
-      potential_win: potentialWin
+      stake: Number(challenge.stake),
+      total_pot: Number(challenge.stake) * 2
     };
 
   } catch (err) {
-
     await conn.rollback();
-
-    if (err.code) throw err;
-
-    console.error('[ACCEPT_CHALLENGE_SERVICE_ERROR]', err);
-
-    throw serviceError('ACCEPT_CHALLENGE_FAILED');
-
+    throw err.code ? err : serviceError('ACCEPT_CHALLENGE_FAILED');
   } finally {
-
     conn.release();
-
   }
+};
 
+/* =========================================================
+   CANCEL CHALLENGE
+========================================================= */
+exports.cancelChallenge = async ({
+  userId,
+  inviteCode
+}) => {
+
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    const [[challenge]] = await conn.query(
+      `SELECT *
+       FROM head_to_head_challenges
+       WHERE invite_code = ?
+       FOR UPDATE`,
+      [inviteCode]
+    );
+
+    if (!challenge) throw serviceError('CHALLENGE_NOT_FOUND');
+    if (challenge.status !== 'pending')
+      throw serviceError('CANNOT_CANCEL');
+
+    if (challenge.creator_user_id !== userId)
+      throw serviceError('NOT_CHALLENGE_OWNER');
+
+    /* ---------- RELEASE LOCK ---------- */
+    await WalletService.unlock({
+      walletId: challenge.creator_wallet_id,
+      lockId: challenge.creator_lock_id,
+      conn
+    });
+
+    await conn.query(
+      `UPDATE head_to_head_challenges
+       SET status = 'cancelled',
+           cancelled_at = NOW()
+       WHERE id = ?`,
+      [challenge.id]
+    );
+
+    await conn.commit();
+
+    return { cancelled: true };
+
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 };
 
 /* =========================================================
@@ -602,107 +530,7 @@ else if (['settled', 'voided'].includes(row.status)) {
   return enriched;
 
 };
-/* =========================================================
-   CANCEL CHALLENGE (CREATOR ONLY)
-========================================================= */
-exports.cancelChallenge = async ({
-  userId,
-  inviteCode
-}) => {
 
-  const conn = await pool.getConnection();
-
-  try {
-
-    await conn.beginTransaction();
-
-    /* =========================
-       LOCK CHALLENGE
-    ========================= */
-    const [[challenge]] =
-      await conn.query(
-        `
-        SELECT *
-        FROM head_to_head_challenges
-        WHERE invite_code = ?
-        FOR UPDATE
-        `,
-        [inviteCode]
-      );
-
-    if (!challenge)
-      throw serviceError('CHALLENGE_NOT_FOUND');
-
-    if (challenge.status !== 'pending')
-      throw serviceError('CANNOT_CANCEL');
-
-    if (challenge.creator_user_id !== userId)
-      throw serviceError('NOT_CHALLENGE_OWNER');
-
-
-    /* =========================
-       VALIDATE QUESTION STATE
-    ========================= */
-    const [[question]] =
-      await conn.query(
-        `
-        SELECT status
-        FROM head_to_head_questions
-        WHERE id = ?
-        FOR UPDATE
-        `,
-        [challenge.question_id]
-      );
-
-    if (!question)
-      throw serviceError('QUESTION_NOT_FOUND');
-
-    if (question.status !== 'published')
-      throw serviceError('CANNOT_CANCEL');
-
-
-    /* =========================
-       UNLOCK ESCROW
-    ========================= */
-    await Escrow.unlockFunds({
-      conn,
-      walletId: challenge.creator_wallet_id,
-      amount: challenge.stake
-    });
-
-
-    /* =========================
-       UPDATE STATUS
-    ========================= */
-    await conn.query(
-      `
-      UPDATE head_to_head_challenges
-      SET
-        status = 'cancelled',
-        cancelled_at = NOW()
-      WHERE id = ?
-      `,
-      [challenge.id]
-    );
-
-    await conn.commit();
-
-    return { cancelled: true };
-
-  }
-  catch (err) {
-
-    await conn.rollback();
-    throw err;
-
-  }
-  finally {
-
-    conn.release();
-
-  }
-
-};
 /* =========================================================
    LIST AVAILABLE 1V1 QUESTIONS (USER APP)
    Shows questions user can create challenge on

@@ -1,7 +1,8 @@
 'use strict';
 
 const pool = require('../config/db');
-const System = require('./services/system.service');
+const WalletService = require('./wallet.service');
+const System = require('./system.service');
 
 function settlementError(code) {
   const e = new Error(code);
@@ -14,8 +15,12 @@ function settlementError(code) {
 ========================================================= */
 exports.settleByQuestion = async ({
   questionId,
-  outcome
+  outcome // 'YES' | 'NO'
 }) => {
+
+  if (!['YES', 'NO'].includes(outcome)) {
+    throw settlementError('INVALID_OUTCOME');
+  }
 
   const conn = await pool.getConnection();
 
@@ -24,124 +29,90 @@ exports.settleByQuestion = async ({
     await conn.beginTransaction();
 
     /* =========================
-       LOAD SYSTEM SETTINGS
+       SYSTEM SETTINGS
     ========================= */
     const commissionPercent =
-      await System.getDecimal(
-        'H2H_COMMISSION_PERCENT'
-      );
+      await System.getDecimal('H2H_COMMISSION_PERCENT');
 
     /* =========================
        LOCK CHALLENGES
     ========================= */
-    const [challenges] =
-      await conn.query(
-        `
-        SELECT *
-        FROM head_to_head_challenges
-        WHERE question_id = ?
+    const [challenges] = await conn.query(
+      `
+      SELECT *
+      FROM head_to_head_challenges
+      WHERE question_id = ?
         AND status = 'accepted'
-        FOR UPDATE
-        `,
-        [questionId]
-      );
+      FOR UPDATE
+      `,
+      [questionId]
+    );
 
     for (const c of challenges) {
 
-      let winnerUserId;
-      let winnerWalletId;
-
+      /* =========================
+         DETERMINE WINNER
+      ========================= */
       const creatorWon =
-        (outcome === 'YES'
-          && c.creator_side === 'yes') ||
+        (outcome === 'YES' && c.creator_side === 'yes') ||
+        (outcome === 'NO' && c.creator_side === 'no');
 
-        (outcome === 'NO'
-          && c.creator_side === 'no');
+      const winnerUserId = creatorWon
+        ? c.creator_user_id
+        : c.opponent_user_id;
 
-      if (creatorWon) {
-
-        winnerUserId =
-          c.creator_user_id;
-
-        winnerWalletId =
-          c.creator_wallet_id;
-
-      }
-      else {
-
-        winnerUserId =
-          c.opponent_user_id;
-
-        winnerWalletId =
-          c.opponent_wallet_id;
-
-      }
-
-      const totalPot =
-        Number(c.stake) * 2;
-
-      const commission =
-        totalPot *
-        (commissionPercent / 100);
-
-      const payout =
-        totalPot - commission;
+      const winnerWalletId = creatorWon
+        ? c.creator_wallet_id
+        : c.opponent_wallet_id;
 
       /* =========================
-         UNLOCK BOTH SIDES
+         CALCULATE PAYOUT
       ========================= */
-      await conn.query(
-        `
-        UPDATE wallets
-        SET locked_balance =
-            locked_balance - ?
-        WHERE id IN (?, ?)
-        `,
-        [
-          c.stake,
-          c.creator_wallet_id,
-          c.opponent_wallet_id
-        ]
-      );
+      const stake = Number(c.stake);
+      const totalPot = stake * 2;
+
+      const commission =
+        (totalPot * Number(commissionPercent)) / 100;
+
+      const payout = Number((totalPot - commission).toFixed(2));
+
+      /* =========================
+         CONSUME LOCKS (CRITICAL)
+      ========================= */
+      if (!c.creator_lock_id || !c.opponent_lock_id) {
+        throw settlementError('LOCK_REFERENCE_MISSING');
+      }
+
+      await WalletService.consumeLocked({
+        walletId: c.creator_wallet_id,
+        lockId: c.creator_lock_id,
+        conn
+      });
+
+      await WalletService.consumeLocked({
+        walletId: c.opponent_wallet_id,
+        lockId: c.opponent_lock_id,
+        conn
+      });
 
       /* =========================
          CREDIT WINNER
       ========================= */
-      await conn.query(
-        `
-        UPDATE wallets
-        SET balance = balance + ?
-        WHERE id = ?
-        `,
-        [
-          payout,
-          winnerWalletId
-        ]
-      );
-
-      /* =========================
-         TRANSACTION LOG
-      ========================= */
-      await conn.query(
-        `
-        INSERT INTO wallet_transactions
-        (
-          wallet_id,
-          user_id,
-          type,
-          amount,
-          source_type,
-          source_id
-        )
-        VALUES (?, ?, 'credit', ?, 'h2h_settlement', ?)
-        `,
-        [
-          winnerWalletId,
-          winnerUserId,
-          payout,
-          c.uuid
-        ]
-      );
+      await WalletService.credit({
+        walletId: winnerWalletId,
+        userId: winnerUserId,
+        amount: payout,
+        reference_type: 'h2h_settlement',
+        reference_id: c.uuid,
+        idempotency_key: `h2h_settlement:${c.uuid}`,
+        metadata: {
+          question_id: c.question_id,
+          stake,
+          total_pot: totalPot,
+          commission
+        },
+        conn
+      });
 
       /* =========================
          UPDATE CHALLENGE
@@ -152,11 +123,13 @@ exports.settleByQuestion = async ({
         SET
           status = 'settled',
           winner_user_id = ?,
+          payout = ?,
           settled_at = NOW()
         WHERE id = ?
         `,
         [
           winnerUserId,
+          payout,
           c.id
         ]
       );
@@ -167,11 +140,9 @@ exports.settleByQuestion = async ({
       await conn.query(
         `
         UPDATE head_to_head_entries
-        SET
-          status =
+        SET status =
           CASE
-            WHEN user_id = ?
-            THEN 'won'
+            WHEN user_id = ? THEN 'won'
             ELSE 'lost'
           END
         WHERE challenge_id = ?
@@ -186,14 +157,17 @@ exports.settleByQuestion = async ({
 
     await conn.commit();
 
-  }
-  catch (err) {
+    return {
+      success: true,
+      settled_count: challenges.length
+    };
+
+  } catch (err) {
 
     await conn.rollback();
     throw err;
 
-  }
-  finally {
+  } finally {
 
     conn.release();
 

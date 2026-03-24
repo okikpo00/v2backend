@@ -2,33 +2,59 @@
 
 const pool = require('../config/db');
 
+/* =========================
+   ERROR HELPER
+========================= */
 function userError(code, message) {
   const e = new Error(message || code);
   e.code = code;
   return e;
 }
 
+/* =========================
+   HELPERS
+========================= */
+function safeCursor(cursor) {
+  const id = Number(cursor);
+  return isNaN(id) ? null : id;
+}
+
 /* =========================================================
    FETCH USERS (PAGINATED)
 ========================================================= */
-exports.fetchUsers = async ({ status, email, cursor, limit = 50 }) => {
+exports.fetchUsers = async ({
+  status,
+  email,
+  cursor,
+  limit = 50
+}) => {
+
+  limit = Math.min(Number(limit) || 50, 100);
+
+  const filters = [];
   const params = [];
-  let where = 'WHERE 1=1';
 
   if (status) {
-    where += ' AND u.status = ?';
+    filters.push('u.status = ?');
     params.push(status);
   }
 
   if (email) {
-    where += ' AND u.email LIKE ?';
+    filters.push('u.email LIKE ?');
     params.push(`%${email}%`);
   }
 
-  if (cursor) {
-    where += ' AND u.id < ?';
-    params.push(cursor);
+  const cursorId = safeCursor(cursor);
+
+  if (cursorId) {
+    filters.push('u.id < ?');
+    params.push(cursorId);
   }
+
+  const whereClause =
+    filters.length > 0
+      ? `WHERE ${filters.join(' AND ')}`
+      : '';
 
   const [rows] = await pool.query(
     `
@@ -43,14 +69,19 @@ exports.fetchUsers = async ({ status, email, cursor, limit = 50 }) => {
       u.email_verified_at,
       u.last_login_at,
       u.created_at,
-COALESCE(w.balance, 0)        AS balance,
-COALESCE(w.locked_balance, 0) AS locked_balance
+
+      COALESCE(w.balance, 0) AS balance,
+      COALESCE(w.locked_balance, 0) AS locked_balance,
+      (COALESCE(w.balance, 0) - COALESCE(w.locked_balance, 0)) AS available_balance
 
     FROM users u
+
     LEFT JOIN wallets w
-  ON w.user_id = u.id
- AND w.currency = 'NGN'
-    ${where}
+      ON w.user_id = u.id
+     AND w.currency = 'NGN'
+
+    ${whereClause}
+
     ORDER BY u.id DESC
     LIMIT ?
     `,
@@ -61,25 +92,46 @@ COALESCE(w.locked_balance, 0) AS locked_balance
   let items = rows;
 
   if (rows.length > limit) {
-    nextCursor = rows[limit - 1].id;
+    const last = rows[limit - 1];
+    nextCursor = last.id;
     items = rows.slice(0, limit);
   }
 
-  return { items, next_cursor: nextCursor };
+  return {
+    items,
+    next_cursor: nextCursor
+  };
 };
 
 /* =========================================================
    FETCH SINGLE USER (FULL PROFILE)
 ========================================================= */
 exports.getUser = async (userId) => {
+
   const [[user]] = await pool.query(
     `
     SELECT
-      u.*,
-      w.balance,
-      w.locked_balance
+      u.id,
+      u.uuid,
+      u.email,
+      u.username,
+      u.first_name,
+      u.last_name,
+      u.status,
+      u.email_verified_at,
+      u.last_login_at,
+      u.created_at,
+
+      COALESCE(w.balance, 0) AS balance,
+      COALESCE(w.locked_balance, 0) AS locked_balance,
+      (COALESCE(w.balance, 0) - COALESCE(w.locked_balance, 0)) AS available_balance
+
     FROM users u
-    LEFT JOIN wallets w ON w.id = u.default_wallet_id
+
+    LEFT JOIN wallets w
+      ON w.user_id = u.id
+     AND w.currency = 'NGN'
+
     WHERE u.id = ?
     LIMIT 1
     `,
@@ -87,6 +139,7 @@ exports.getUser = async (userId) => {
   );
 
   if (!user) throw userError('USER_NOT_FOUND');
+
   return user;
 };
 
@@ -99,9 +152,17 @@ exports.changeStatus = async ({
   reason,
   admin
 }) => {
+
+  const allowedStatuses = ['active', 'suspended', 'banned'];
+
+  if (!allowedStatuses.includes(newStatus)) {
+    throw userError('INVALID_STATUS');
+  }
+
   const conn = await pool.getConnection();
 
   try {
+
     await conn.beginTransaction();
 
     const [[user]] = await conn.query(
@@ -124,7 +185,13 @@ exports.changeStatus = async ({
       `INSERT INTO user_status_history
        (user_id, old_status, new_status, reason, admin_id)
        VALUES (?, ?, ?, ?, ?)`,
-      [userId, user.status, newStatus, reason, admin.adminId]
+      [
+        userId,
+        user.status,
+        newStatus,
+        reason || null,
+        admin.adminId
+      ]
     );
 
     await conn.query(
@@ -136,15 +203,22 @@ exports.changeStatus = async ({
         admin.role,
         `USER_${newStatus.toUpperCase()}`,
         String(userId),
-        JSON.stringify({ reason })
+        JSON.stringify({ reason: reason || null })
       ]
     );
 
     await conn.commit();
+
+    return { success: true };
+
   } catch (e) {
+
     await conn.rollback();
     throw e;
+
   } finally {
+
     conn.release();
+
   }
 };

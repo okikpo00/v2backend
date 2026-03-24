@@ -174,6 +174,17 @@ exports.lock = async ({ id, adminId, ip, userAgent }) => {
 /* =========================================================
    SETTLE QUESTION (PRODUCTION SAFE)
 ========================================================= */
+'use strict';
+
+const pool = require('../config/db');
+const WalletService = require('./wallet.service');
+
+function serviceError(code) {
+  const e = new Error(code);
+  e.code = code;
+  return e;
+}
+
 exports.settle = async ({
   id,
   outcome,
@@ -182,7 +193,7 @@ exports.settle = async ({
   userAgent
 }) => {
 
-  if (!['YES','NO'].includes(outcome)) {
+  if (!['YES', 'NO'].includes(outcome)) {
     throw serviceError('INVALID_OUTCOME');
   }
 
@@ -192,267 +203,102 @@ exports.settle = async ({
 
     await conn.beginTransaction();
 
-    /* =====================================
-       LOCK QUESTION
-    ===================================== */
+    /* LOCK QUESTION */
     const [[question]] = await conn.query(
-      `
-      SELECT id, status
-      FROM head_to_head_questions
-      WHERE id = ?
-      FOR UPDATE
-      `,
+      `SELECT id, status FROM head_to_head_questions WHERE id = ? FOR UPDATE`,
       [id]
     );
 
-    if (!question)
-      throw serviceError('QUESTION_NOT_FOUND');
+    if (!question) throw serviceError('QUESTION_NOT_FOUND');
+    if (question.status !== 'locked') throw serviceError('INVALID_STATE');
 
-    if (question.status !== 'locked')
-      throw serviceError('INVALID_STATE');
-
-
-    /* =====================================
-       SET QUESTION SETTLED
-    ===================================== */
+    /* SET QUESTION */
     await conn.query(
-      `
-      UPDATE head_to_head_questions
-      SET
-        status = 'settled',
-        outcome = ?,
-        settled_at = NOW()
-      WHERE id = ?
-      `,
+      `UPDATE head_to_head_questions
+       SET status = 'settled', outcome = ?, settled_at = NOW()
+       WHERE id = ?`,
       [outcome, id]
     );
 
-
-    /* =====================================
-       LOAD COMPANY FEE
-    ===================================== */
+    /* LOAD FEE */
     const [[feeRow]] = await conn.query(
-      `
-      SELECT value
-      FROM system_settings
-      WHERE \`key\` = 'H2H_FEE_PERCENT'
-      LIMIT 1
-      `
+      `SELECT value FROM system_settings WHERE \`key\`='H2H_FEE_PERCENT' LIMIT 1`
     );
 
     const feePercent = Number(feeRow?.value || 0);
 
-
-    /* =====================================
-       LOCK ACCEPTED CHALLENGES
-    ===================================== */
+    /* LOCK CHALLENGES */
     const [challenges] = await conn.query(
-      `
-      SELECT *
-      FROM head_to_head_challenges
-      WHERE question_id = ?
-        AND status = 'accepted'
-      FOR UPDATE
-      `,
+      `SELECT * FROM head_to_head_challenges
+       WHERE question_id = ? AND status = 'accepted'
+       FOR UPDATE`,
       [id]
     );
 
-
-    /* =====================================
-       PROCESS EACH CHALLENGE
-    ===================================== */
     for (const c of challenges) {
+
+      if (!c.creator_lock_id || !c.opponent_lock_id) {
+        throw serviceError('LOCK_REFERENCE_MISSING');
+      }
 
       const stake = Number(c.stake);
       const totalPool = stake * 2;
 
       const fee = (totalPool * feePercent) / 100;
-      const winnerPayout = totalPool - fee;
+      const payout = Number((totalPool - fee).toFixed(2));
 
-      let winnerUserId;
-      let winnerWalletId;
+      const creatorWon =
+        c.creator_side.toUpperCase() === outcome;
 
-      const creatorSideUpper = c.creator_side.toUpperCase();
+      const winnerUserId = creatorWon
+        ? c.creator_user_id
+        : c.opponent_user_id;
 
-      if (creatorSideUpper === outcome) {
-        winnerUserId = c.creator_user_id;
-        winnerWalletId = c.creator_wallet_id;
-      } else {
-        winnerUserId = c.opponent_user_id;
-        winnerWalletId = c.opponent_wallet_id;
-      }
+      const winnerWalletId = creatorWon
+        ? c.creator_wallet_id
+        : c.opponent_wallet_id;
 
+      /* 🔒 CONSUME LOCKS */
+      await WalletService.consumeLocked({
+        walletId: c.creator_wallet_id,
+        lockId: c.creator_lock_id,
+        conn
+      });
 
-      /* =====================================
-         LOCK BOTH WALLETS
-      ===================================== */
+      await WalletService.consumeLocked({
+        walletId: c.opponent_wallet_id,
+        lockId: c.opponent_lock_id,
+        conn
+      });
+
+      /* 💰 CREDIT WINNER */
+      await WalletService.credit({
+        walletId: winnerWalletId,
+        userId: winnerUserId,
+        amount: payout,
+        reference_type: 'h2h_settlement',
+        reference_id: c.uuid,
+        idempotency_key: `h2h_settlement:${c.uuid}`,
+        metadata: { fee, totalPool },
+        conn
+      });
+
+      /* UPDATE CHALLENGE */
       await conn.query(
-        `
-        SELECT id
-        FROM wallets
-        WHERE id IN (?, ?)
-        FOR UPDATE
-        `,
-        [
-          c.creator_wallet_id,
-          c.opponent_wallet_id
-        ]
+        `UPDATE head_to_head_challenges
+         SET status='settled',
+             winner_user_id=?,
+             payout=?
+         WHERE id=?`,
+        [winnerUserId, payout, c.id]
       );
-
-
-      /* =====================================
-         RELEASE ESCROW
-      ===================================== */
-      await conn.query(
-        `
-        UPDATE wallets
-        SET locked_balance = locked_balance - ?
-        WHERE id = ?
-        `,
-        [stake, c.creator_wallet_id]
-      );
-
-      await conn.query(
-        `
-        UPDATE wallets
-        SET locked_balance = locked_balance - ?
-        WHERE id = ?
-        `,
-        [stake, c.opponent_wallet_id]
-      );
-
-
-      /* =====================================
-         READ WINNER WALLET BALANCE
-      ===================================== */
-      const [[wallet]] = await conn.query(
-        `
-        SELECT balance
-        FROM wallets
-        WHERE id = ?
-        FOR UPDATE
-        `,
-        [winnerWalletId]
-      );
-
-      const balanceBefore = Number(wallet.balance);
-      const balanceAfter = balanceBefore + winnerPayout;
-
-
-      /* =====================================
-         CREDIT WINNER
-      ===================================== */
-      await conn.query(
-        `
-        UPDATE wallets
-        SET balance = ?
-        WHERE id = ?
-        `,
-        [
-          balanceAfter,
-          winnerWalletId
-        ]
-      );
-
-
-      /* =====================================
-         TRANSACTION LOG (WINNER)
-      ===================================== */
-      await conn.query(
-        `
-        INSERT INTO wallet_transactions
-        (
-          wallet_id,
-          user_id,
-          type,
-          amount,
-          balance_before,
-          balance_after,
-          source_type,
-          source_id
-        )
-        VALUES (?, ?, 'credit', ?, ?, ?, 'h2h_settlement', ?)
-        `,
-        [
-          winnerWalletId,
-          winnerUserId,
-          winnerPayout,
-          balanceBefore,
-          balanceAfter,
-          c.uuid
-        ]
-      );
-
-
-      /* =====================================
-         TRANSACTION LOG (COMPANY FEE)
-      ===================================== */
-      if (fee > 0) {
-
-        await conn.query(
-          `
-          INSERT INTO wallet_transactions
-          (
-            wallet_id,
-            user_id,
-            type,
-            amount,
-            balance_before,
-            balance_after,
-            source_type,
-            source_id
-          )
-          VALUES (NULL, NULL, 'fee', ?, 0, 0, 'h2h_fee', ?)
-          `,
-          [
-            fee,
-            c.uuid
-          ]
-        );
-
-      }
-
-
-      /* =====================================
-         UPDATE CHALLENGE
-      ===================================== */
-      await conn.query(
-        `
-        UPDATE head_to_head_challenges
-        SET
-          status = 'settled',
-          winner_user_id = ?,
-          payout = ?
-        WHERE id = ?
-        `,
-        [
-          winnerUserId,
-          winnerPayout,
-          c.id
-        ]
-      );
-
     }
 
-
-    /* =====================================
-       ADMIN AUDIT
-    ===================================== */
+    /* AUDIT */
     await conn.query(
-      `
-      INSERT INTO admin_audit_logs
-      (
-        admin_id,
-        actor_role,
-        action,
-        target_type,
-        target_id,
-        ip_address,
-        user_agent,
-        metadata
-      )
-      VALUES (?, 'content', 'h2h_settle', 'h2h_question', ?, ?, ?, ?)
-      `,
+      `INSERT INTO admin_audit_logs
+       (admin_id, actor_role, action, target_type, target_id, ip_address, user_agent, metadata)
+       VALUES (?, 'content', 'h2h_settle', 'h2h_question', ?, ?, ?, ?)`,
       [
         adminId,
         id,
@@ -464,21 +310,13 @@ exports.settle = async ({
 
     await conn.commit();
 
-  }
-  catch (err) {
-
+  } catch (err) {
     await conn.rollback();
     throw err;
-
-  }
-  finally {
-
+  } finally {
     conn.release();
-
   }
-
 };
-
 /* =========================================================
    VOID QUESTION (PRODUCTION SAFE)
 ========================================================= */
@@ -497,176 +335,58 @@ exports.void = async ({
     await conn.beginTransaction();
 
     const [[question]] = await conn.query(
-      `
-      SELECT id, status
-      FROM head_to_head_questions
-      WHERE id = ?
-      FOR UPDATE
-      `,
+      `SELECT id, status FROM head_to_head_questions WHERE id=? FOR UPDATE`,
       [id]
     );
 
-    if (!question)
-      throw serviceError('QUESTION_NOT_FOUND');
-
-    if (question.status !== 'locked')
-      throw serviceError('INVALID_STATE');
-
-
+    if (!question) throw serviceError('QUESTION_NOT_FOUND');
+    if (question.status !== 'locked') throw serviceError('INVALID_STATE');
 
     await conn.query(
-      `
-      UPDATE head_to_head_questions
-      SET
-        status = 'voided',
-        settled_at = NOW()
-      WHERE id = ?
-      `,
+      `UPDATE head_to_head_questions
+       SET status='voided', settled_at=NOW()
+       WHERE id=?`,
       [id]
     );
 
-
-const [challenges] = await conn.query(
-`
-SELECT *
-FROM head_to_head_challenges
-WHERE question_id = ?
-AND status IN ('accepted','locked')
-FOR UPDATE
-`,
-[id]
-);
-
+    const [challenges] = await conn.query(
+      `SELECT * FROM head_to_head_challenges
+       WHERE question_id=? AND status IN ('accepted','locked')
+       FOR UPDATE`,
+      [id]
+    );
 
     for (const c of challenges) {
 
-      const stake = Number(c.stake);
+      if (!c.creator_lock_id || !c.opponent_lock_id) {
+        throw serviceError('LOCK_REFERENCE_MISSING');
+      }
+
+      /* 🔓 JUST UNLOCK (NO CREDIT MANUAL) */
+      await WalletService.unlock({
+        walletId: c.creator_wallet_id,
+        lockId: c.creator_lock_id,
+        conn
+      });
+
+      await WalletService.unlock({
+        walletId: c.opponent_wallet_id,
+        lockId: c.opponent_lock_id,
+        conn
+      });
 
       await conn.query(
-        `
-        SELECT id
-        FROM wallets
-        WHERE id IN (?, ?)
-        FOR UPDATE
-        `,
-        [
-          c.creator_wallet_id,
-          c.opponent_wallet_id
-        ]
-      );
-
-
-      /* RELEASE ESCROW + REFUND */
-
-      await conn.query(
-        `
-        UPDATE wallets
-        SET
-          locked_balance = locked_balance - ?,
-          balance = balance + ?
-        WHERE id = ?
-        `,
-        [stake, stake, c.creator_wallet_id]
-      );
-
-
-      await conn.query(
-        `
-        UPDATE wallets
-        SET
-          locked_balance = locked_balance - ?,
-          balance = balance + ?
-        WHERE id = ?
-        `,
-        [stake, stake, c.opponent_wallet_id]
-      );
-
-
-const [[creatorWallet]] = await conn.query(
-`
-SELECT balance
-FROM wallets
-WHERE id = ?
-`,
-[c.creator_wallet_id]
-);
-
-const creatorBefore = Number(creatorWallet.balance);
-const creatorAfter = creatorBefore + stake;
-
-await conn.query(
-`
-INSERT INTO wallet_transactions
-(wallet_id,user_id,type,amount,balance_before,balance_after,source_type,source_id)
-VALUES (?, ?, 'credit', ?, ?, ?, 'h2h_refund', ?)
-`,
-[
-c.creator_wallet_id,
-c.creator_user_id,
-stake,
-creatorBefore,
-creatorAfter,
-c.uuid
-]
-);
-
-     
-const [[opponentWallet]] = await conn.query(
-`
-SELECT balance
-FROM wallets
-WHERE id = ?
-`,
-[c.opponent_wallet_id]
-);
-
-const opponentBefore = Number(opponentWallet.balance);
-const opponentAfter = opponentBefore + stake;
-
-await conn.query(
-`
-INSERT INTO wallet_transactions
-(wallet_id,user_id,type,amount,balance_before,balance_after,source_type,source_id)
-VALUES (?, ?, 'credit', ?, ?, ?, 'h2h_refund', ?)
-`,
-[
-c.opponent_wallet_id,
-c.opponent_user_id,
-stake,
-opponentBefore,
-opponentAfter,
-c.uuid
-]
-);
-
-      await conn.query(
-        `
-        UPDATE head_to_head_challenges
-        SET status = 'voided', payout = 0
-        WHERE id = ?
-        `,
+        `UPDATE head_to_head_challenges
+         SET status='voided', payout=0
+         WHERE id=?`,
         [c.id]
       );
-
     }
 
-
-
     await conn.query(
-      `
-      INSERT INTO admin_audit_logs
-      (
-        admin_id,
-        actor_role,
-        action,
-        target_type,
-        target_id,
-        ip_address,
-        user_agent,
-        metadata
-      )
-      VALUES (?, 'content', 'h2h_void', 'h2h_question', ?, ?, ?, ?)
-      `,
+      `INSERT INTO admin_audit_logs
+       (admin_id, actor_role, action, target_type, target_id, ip_address, user_agent, metadata)
+       VALUES (?, 'content', 'h2h_void', 'h2h_question', ?, ?, ?, ?)`,
       [
         adminId,
         id,
@@ -676,24 +396,15 @@ c.uuid
       ]
     );
 
-
     await conn.commit();
 
-  }
-  catch (err) {
-
+  } catch (err) {
     await conn.rollback();
     throw err;
-
-  }
-  finally {
-
+  } finally {
     conn.release();
-
   }
-
 };
-
 /* =========================
    LIST QUESTIONS (ADMIN)
 ========================= */
